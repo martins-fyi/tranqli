@@ -1,0 +1,59 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# --- PyInstaller ---
+dist/
+build/
+*.spec
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Editor / IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Logs ---
+*.log
+
+# --- Old / renamed-away entry script ---
+traenky.py
+
+# --- Icon design intermediates (kept locally, not in repo) ---
+icon_*.png
+Tranqli_blur_*.png
+Tranqli_blur_*.ico
+
+# --- User data (lives in %APPDATA%\Tranqli\ — safety net) ---
+sessions.csv
+config.json
+active_session.json
+
+# --- Working session notes (kept local) ---
+session-handoff.md
+
+# --- Claude Code local state ---
+.claude/
+
+# --- Stale root-level assets/ (active fonts live in green_tracker/assets/) ---
+/assets/

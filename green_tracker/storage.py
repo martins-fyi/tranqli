@@ -1,0 +1,598 @@
+from __future__ import annotations
+
+import csv
+import json
+import os
+from pathlib import Path
+from typing import NamedTuple, Optional
+
+FIELDNAMES = ["date", "tag", "session_name", "minutes"]
+
+
+class SessionRow(NamedTuple):
+    date: str          # YYYY-MM-DD
+    tag: str
+    session_name: str
+    minutes: int
+
+
+# ------------------------------------------------------------------
+# Path resolution
+# ------------------------------------------------------------------
+
+def get_data_dir() -> Path:
+    """Return the directory used for sessions.csv and config.json.
+
+    Priority:
+    1. TRANQLI_DATA_DIR env var (used in tests / portable installs),
+       or its legacy alias TRAENKY_DATA_DIR for one-release backward
+       compat with prior installs.
+    2. %APPDATA%\\Tranqli\\ on Windows
+    3. ~/.tranqli/ fallback (Linux / WSL dev)
+
+    A one-time migration runs at module import via
+    `_migrate_legacy_data_if_needed()` to move pre-rename data
+    (under the old "Traenky" name) into this new location.
+    """
+    override = (os.environ.get("TRANQLI_DATA_DIR")
+                or os.environ.get("TRAENKY_DATA_DIR"))
+    if override:
+        return Path(override)
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Tranqli"
+    return Path.home() / ".tranqli"
+
+
+def _legacy_data_dir() -> Optional[Path]:
+    """Return the previous app-name's data directory if it exists on
+    disk, else None. Used by the migration helper below.
+
+    Checks the same priority order as get_data_dir() but for the
+    pre-rename "Traenky" name. Does NOT honour the env-var override —
+    if the user set TRANQLI_DATA_DIR explicitly, they're pointing at a
+    deliberate location and we don't want to clobber whatever's there
+    with a side-channel migration.
+    """
+    appdata = os.environ.get("APPDATA")
+    candidates = []
+    if appdata:
+        candidates.append(Path(appdata) / "Traenky")
+    candidates.append(Path.home() / ".traenky")
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+def migrate_legacy_data_if_needed() -> None:
+    """One-time migration from the pre-rename Traenky data directory
+    to the current Tranqli location.
+
+    Runs on every startup but is a no-op in the steady state — only
+    acts when the new directory doesn't yet exist AND the old one
+    does. Implemented as a directory rename, so file mtimes are
+    preserved and we don't briefly hold two copies of the user's
+    session history.
+
+    Safe on all platforms — `_legacy_data_dir()` returns None on
+    systems where the old layout was never installed.
+
+    Idempotent: if the user has already migrated, or has a fresh
+    Tranqli install on top of a leftover Traenky directory, the new
+    dir exists and we leave the old one alone (the user can delete
+    it manually if they want).
+    """
+    new_dir = get_data_dir()
+    if new_dir.exists():
+        return
+    old_dir = _legacy_data_dir()
+    if old_dir is None:
+        return
+    try:
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        old_dir.rename(new_dir)
+    except OSError:
+        # If the rename fails (cross-volume, permission, etc.) fall
+        # back to a defensive copy + leave the old dir in place. The
+        # user's data stays safe; on next launch we'll find the new
+        # dir and skip migration entirely.
+        import shutil
+        try:
+            shutil.copytree(old_dir, new_dir)
+        except OSError:
+            pass  # Best-effort — worst case is a "new user" experience.
+
+
+def get_csv_path() -> Path:
+    return get_data_dir() / "sessions.csv"
+
+
+def get_config_path() -> Path:
+    return get_data_dir() / "config.json"
+
+
+def get_active_snapshot_path() -> Path:
+    """Path for the crash-safety snapshot of the live session.
+    Refreshed every ~3 min while tracking; deleted on save / discard /
+    recovery. Lives alongside sessions.csv and config.json."""
+    return get_data_dir() / "active_session.json"
+
+
+def _ensure_dir() -> None:
+    get_data_dir().mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------------
+# CSV read / write
+# ------------------------------------------------------------------
+
+def load_sessions() -> list[SessionRow]:
+    path = get_csv_path()
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [
+            SessionRow(
+                date=row["date"],
+                tag=row["tag"],
+                session_name=row["session_name"],
+                minutes=int(row["minutes"]),
+            )
+            for row in reader
+        ]
+
+
+def save_sessions(sessions: list[SessionRow]) -> None:
+    _ensure_dir()
+    with get_csv_path().open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        for row in sessions:
+            writer.writerow(row._asdict())
+
+
+# ------------------------------------------------------------------
+# Merge logic
+# ------------------------------------------------------------------
+
+def merge_into(sessions: list[SessionRow], new_row: SessionRow) -> list[SessionRow]:
+    """Add new_row's minutes to an existing (tag, date) row, or append it."""
+    result: list[SessionRow] = []
+    merged = False
+    for row in sessions:
+        if row.tag == new_row.tag and row.date == new_row.date:
+            result.append(row._replace(minutes=row.minutes + new_row.minutes))
+            merged = True
+        else:
+            result.append(row)
+    if not merged:
+        result.append(new_row)
+    return result
+
+
+def commit_session(
+    tag: str,
+    date_str: str,
+    minutes: int,
+    session_name: str | None = None,
+) -> None:
+    """Persist a session, merging into an existing (tag, date) row if present."""
+    if session_name is None:
+        session_name = f"{tag}-{date_str}"
+    new_row = SessionRow(date=date_str, tag=tag, session_name=session_name, minutes=minutes)
+    sessions = load_sessions()
+    sessions = merge_into(sessions, new_row)
+    save_sessions(sessions)
+
+
+def set_minutes_for_tag_date(
+    tag: str,
+    date_str: str,
+    minutes: int,
+    session_name: str | None = None,
+) -> None:
+    """REPLACE (not add) the minutes for the (tag, date_str) row.
+
+    Counterpart to commit_session, which adds. Drives the Retime
+    flow in the menu and archive — the user is asserting an exact
+    total for that day's tag, not contributing to a running sum.
+
+    - minutes > 0, row exists: replace the row's minutes; keep its
+      existing session_name (renaming is a separate concern).
+    - minutes > 0, no row: create a new row using session_name or
+      the default "tag-date_str" if not provided.
+    - minutes == 0, row exists: drop the row. Matches the brief's
+      "no row for an empty day" invariant.
+    - minutes == 0, no row: no-op.
+    """
+    sessions = load_sessions()
+    for i, row in enumerate(sessions):
+        if row.tag == tag and row.date == date_str:
+            if minutes == 0:
+                sessions.pop(i)
+            else:
+                sessions[i] = row._replace(minutes=minutes)
+            save_sessions(sessions)
+            return
+    if minutes > 0:
+        if session_name is None:
+            session_name = f"{tag}-{date_str}"
+        sessions.append(SessionRow(
+            date=date_str, tag=tag,
+            session_name=session_name, minutes=minutes,
+        ))
+        save_sessions(sessions)
+
+
+# ------------------------------------------------------------------
+# Tag totals
+# ------------------------------------------------------------------
+
+def format_tag_total(minutes: int) -> str:
+    """Format a minute count as 'Xd Xh Xm' with cascading omission of
+    leading zero fields. Mirrors main.py's _format_dhm and the web
+    editor's formatDhm so durations read identically across the menu,
+    archive, and web surfaces.
+
+    Examples:
+        0     -> "00m"
+        45    -> "45m"
+        90    -> "01h 30m"
+        1500  -> "01d 01h 00m"
+
+    Days field grows beyond 2 digits naturally for multi-month
+    aggregates. Once a larger field appears, smaller fields are
+    always shown (even at zero) so the unit anchor is unambiguous
+    — "01d 30m" would be visually ambiguous, "01d 00h 30m" isn't.
+    """
+    m = max(0, int(minutes))
+    days = m // 1440
+    hours = (m % 1440) // 60
+    mins = m % 60
+    if days > 0:
+        return f"{days:02d}d {hours:02d}h {mins:02d}m"
+    if hours > 0:
+        return f"{hours:02d}h {mins:02d}m"
+    return f"{mins:02d}m"
+
+
+def tag_totals(sessions: list[SessionRow] | None = None) -> dict[str, str]:
+    """Return {tag: 'DDd HHh'} summed across all rows for each tag."""
+    if sessions is None:
+        sessions = load_sessions()
+    raw: dict[str, int] = {}
+    for row in sessions:
+        raw[row.tag] = raw.get(row.tag, 0) + row.minutes
+    return {t: format_tag_total(m) for t, m in raw.items()}
+
+
+# ------------------------------------------------------------------
+# Session management
+# ------------------------------------------------------------------
+
+def rename_session(old_name: str, new_name: str) -> bool:
+    """Rename a session by session_name. Returns True if found and renamed."""
+    sessions = load_sessions()
+    updated = [
+        row._replace(session_name=new_name) if row.session_name == old_name else row
+        for row in sessions
+    ]
+    if updated == list(sessions):
+        return False
+    save_sessions(updated)
+    return True
+
+
+def delete_session(session_name: str) -> bool:
+    """Delete a session by session_name. Returns True if found and deleted."""
+    sessions = load_sessions()
+    kept = [row for row in sessions if row.session_name != session_name]
+    if len(kept) == len(sessions):
+        return False
+    save_sessions(kept)
+    return True
+
+
+def retag_session(session_name: str, new_tag: str) -> bool:
+    """Change a session's tag. Returns True if the session was found and
+    updated.
+
+    Handles the (tag, date) collision case: if the new tag combined with
+    the session's date matches an existing different row, the two rows'
+    minutes are summed into the existing one and the renamed row is
+    dropped. This preserves the "one row per (tag, date)" invariant.
+    """
+    sessions = load_sessions()
+    target_idx = None
+    for i, row in enumerate(sessions):
+        if row.session_name == session_name:
+            target_idx = i
+            break
+    if target_idx is None:
+        return False
+
+    target = sessions[target_idx]
+    if target.tag == new_tag:
+        return True  # no-op, nothing to do
+
+    # Look for a collision with another (tag, date) row.
+    for i, row in enumerate(sessions):
+        if i == target_idx:
+            continue
+        if row.tag == new_tag and row.date == target.date:
+            # Merge target's minutes into the existing row, drop target.
+            sessions[i] = row._replace(minutes=row.minutes + target.minutes)
+            sessions.pop(target_idx)
+            save_sessions(sessions)
+            return True
+
+    # No collision — straight tag swap.
+    sessions[target_idx] = target._replace(tag=new_tag)
+    save_sessions(sessions)
+    return True
+
+
+def rename_tag(old_tag: str, new_tag: str) -> bool:
+    """Rename a tag across ALL stored sessions. Returns True if at
+    least one row was affected (renamed or merged).
+
+    Per-date collision handling: when an old_tag row and a new_tag
+    row share the same date, the old row's minutes are folded into
+    the new row and the old row is dropped — preserving the "one
+    row per (tag, date)" invariant. Without a collision the row is
+    simply renamed in place.
+
+    session_name is NOT auto-updated. session_names are arbitrary
+    user-mutable strings (the auto-generated `tag-date` form is just
+    the default at first save). A user who renamed a session before
+    renaming its tag has a reason for the name they chose; we don't
+    second-guess it.
+
+    No-ops cleanly on empty / whitespace / same-name input, returning
+    False without touching storage.
+    """
+    old_tag = old_tag.strip()
+    new_tag = new_tag.strip()
+    if not old_tag or not new_tag or old_tag == new_tag:
+        return False
+
+    sessions = load_sessions()
+
+    # Index existing new_tag rows by date — these are potential merge
+    # targets when we encounter an old_tag row on the same date.
+    new_by_date: dict[str, int] = {
+        row.date: i for i, row in enumerate(sessions) if row.tag == new_tag
+    }
+
+    affected = False
+    drop_indices: list[int] = []
+    for i, row in enumerate(sessions):
+        if row.tag != old_tag:
+            continue
+        affected = True
+        if row.date in new_by_date:
+            # Collision — merge into the existing new_tag row.
+            target_idx = new_by_date[row.date]
+            target = sessions[target_idx]
+            sessions[target_idx] = target._replace(
+                minutes=target.minutes + row.minutes,
+            )
+            drop_indices.append(i)
+        else:
+            # No collision — rename in place. Register the row as a
+            # merge target for any subsequent old_tag rows on the same
+            # date (shouldn't happen given the storage invariant, but
+            # keeps the loop self-consistent).
+            sessions[i] = row._replace(tag=new_tag)
+            new_by_date[row.date] = i
+
+    if not affected:
+        return False
+
+    # Drop merged rows in reverse so earlier indices stay valid.
+    for i in sorted(drop_indices, reverse=True):
+        sessions.pop(i)
+    save_sessions(sessions)
+    return True
+
+
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
+
+# Bumped whenever the config schema needs migration. Pre-rename configs
+# have no version field at all (treated as v1).
+CURRENT_CONFIG_VERSION = 2
+
+# Migration map for the widget_size rename. The four-tier scheme
+# (mini / small / medium / large = 13 / 22 / 48 / 64 px) was collapsed
+# into a three-tier scheme (small / medium / large = 13 / 22 / 48 px,
+# dropping 64 px). The old 'large' falls back to the new 'large'
+# (48 px) since 64 px no longer exists; everything else shifts down a
+# slot so the user's physical size is preserved.
+_WIDGET_SIZE_MIGRATION_V1_TO_V2 = {
+    "mini":   "small",
+    "small":  "medium",
+    "medium": "large",
+    "large":  "large",
+}
+
+
+def _migrate_config(config: dict) -> tuple[dict, bool]:
+    """Apply any one-time field migrations. Returns (config, changed)."""
+    changed = False
+    version = config.get("config_version", 1)
+
+    if version < 2:
+        size = config.get("widget_size")
+        if size in _WIDGET_SIZE_MIGRATION_V1_TO_V2:
+            config["widget_size"] = _WIDGET_SIZE_MIGRATION_V1_TO_V2[size]
+        config["config_version"] = 2
+        changed = True
+
+    return config, changed
+
+
+def load_config() -> dict:
+    path = get_config_path()
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as f:
+        config = json.load(f)
+    config, migrated = _migrate_config(config)
+    if migrated:
+        # Persist the migration so subsequent loads are clean.
+        save_config(config)
+    return config
+
+
+def save_config(config: dict) -> None:
+    _ensure_dir()
+    with get_config_path().open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+# ------------------------------------------------------------------
+# Seed-mode lookup
+# ------------------------------------------------------------------
+
+def today_minutes_for_tag(tag: str, date_str: str) -> int:
+    """Return saved minutes for the (tag, date_str) row, or 0 if no
+    such row exists. Drives the seed-mode display: when a tag is
+    assigned to an active session, the widget's elapsed total is
+    pre-loaded with whatever's already on disk for that tag today so
+    the displayed time reflects the day's running cumulative rather
+    than starting from zero.
+
+    Streams the CSV directly via `csv.DictReader` with short-circuit
+    return on first match — avoids parsing the entire file and
+    constructing a SessionRow for every line just to find one row.
+    Important at startup (called from _auto_resume_today_if_any),
+    where the old `load_sessions()` path scaled linearly with total
+    session history.
+
+    Tolerant of malformed rows: any row whose `minutes` cell can't
+    be parsed as int is silently skipped (treated as no match),
+    matching the rest of the codebase's "best-effort, never crash
+    startup" stance on CSV I/O.
+    """
+    path = get_csv_path()
+    if not path.exists():
+        return 0
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("tag") == tag and row.get("date") == date_str:
+                try:
+                    return int(row.get("minutes", 0))
+                except (TypeError, ValueError):
+                    return 0
+    return 0
+
+
+# ------------------------------------------------------------------
+# Crash-safety snapshot
+# ------------------------------------------------------------------
+#
+# A small JSON file written every ~3 min while the tracker is running,
+# refreshed on every pause/resume transition, and removed on save /
+# discard / clean reset. If the process is killed between save points,
+# the file remains and the next launch can prompt the user to recover
+# the unsaved work into the appropriate (tag, date) row.
+#
+# Format (all fields optional except `tag` and `elapsed_seconds`):
+#   {
+#     "tag":              "work",
+#     "elapsed_seconds":  1842,
+#     "date":             "2026-05-31",   # date the work belongs to
+#     "snapshot_at":      "2026-05-31T16:42:11"  # ISO timestamp
+#   }
+#
+# Worst-case loss: ~3 min of work (one snapshot interval).
+
+
+def write_active_snapshot(data: dict) -> None:
+    """Atomically persist the active session snapshot.
+
+    Writes to a sibling .tmp file then os.replace()s it onto the real
+    path — same crash-safe pattern the brief specifies for sessions.csv.
+    A process kill mid-write leaves either the old snapshot intact or
+    the fully-written new one, never a half-written file."""
+    _ensure_dir()
+    path = get_active_snapshot_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def read_active_snapshot() -> dict | None:
+    """Return the parsed snapshot dict if a snapshot file is present
+    and parseable. None if no file exists, or if the file is corrupt /
+    unreadable (treated as no recoverable snapshot rather than
+    crashing the recovery prompt at startup)."""
+    path = get_active_snapshot_path()
+    if not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def clear_active_snapshot() -> None:
+    """Remove the snapshot file. Called after the in-flight session
+    has been safely persisted (save), explicitly discarded, or
+    recovered into storage. A missing file is a no-op."""
+    path = get_active_snapshot_path()
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------
+# Defensive backup
+# ------------------------------------------------------------------
+#
+# A single sessions.csv.bak file refreshed at most once per 24 h.
+# Cheap insurance against UI bugs, accidental web-editor deletes,
+# or any other path that could mangle the live CSV.
+#
+# Restore procedure: quit the app, rename sessions.csv aside (e.g.
+# to sessions.csv.broken), rename sessions.csv.bak to sessions.csv,
+# relaunch.
+
+
+def maybe_backup_sessions(max_age_hours: int = 24) -> None:
+    """Refresh sessions.csv.bak if no recent backup exists.
+
+    Single-file rotating backup — sessions.csv.bak lives alongside
+    the live CSV in get_data_dir(). Refreshed once every
+    `max_age_hours` (default 24) so frequent app restarts within
+    a day don't immediately overwrite a known-good backup with
+    later state. Best-effort: copy failures are swallowed (the
+    backup is a safety net, not a hard requirement, and we don't
+    want a broken filesystem to prevent the app from starting).
+    """
+    import shutil
+    import time as _time
+    src = get_csv_path()
+    if not src.exists():
+        return
+    backup = src.parent / "sessions.csv.bak"
+    if backup.exists():
+        age = _time.time() - backup.stat().st_mtime
+        if age < max_age_hours * 3600:
+            return  # recent backup exists, leave it alone
+    try:
+        shutil.copy2(src, backup)
+    except OSError:
+        # Non-fatal — backup is best-effort. Continuing without
+        # a fresh backup is preferable to crashing the app on
+        # a transient FS error.
+        pass
