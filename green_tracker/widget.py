@@ -1321,6 +1321,22 @@ class TrackerWidget(QWidget):
             return
         if not self.isVisible():
             return
+
+        # Skip the topmost toggle while the app has an open popup menu
+        # (QMenu) or modal dialog. The NOTOPMOST → TOPMOST cycle creates
+        # enough z-order churn to dismiss popups mid-interaction — most
+        # visibly, the right-click context menu in the Archive window
+        # would disappear within a second of opening. While the user is
+        # interacting with a menu, we don't need to fight for topmost
+        # anyway; the next tick (1 s after they close the menu) will
+        # restore it.
+        app = QApplication.instance()
+        if app is not None and (
+            app.activePopupWidget() is not None
+            or app.activeModalWidget() is not None
+        ):
+            return
+
         try:
             HWND_TOPMOST       = -1
             HWND_NOTOPMOST     = -2

@@ -57,3 +57,6 @@ session-handoff.md
 
 # --- Stale root-level assets/ (active fonts live in green_tracker/assets/) ---
 /assets/
+
+# --- Inno Setup installer output (uploaded to GitHub Releases, not git) ---
+installer/
