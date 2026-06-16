@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tranqli, a quiet time tracker</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inclusive+Sans:wght@400;600&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=uncut-sans@500&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg-outer:   #262626;   /* dark grey, around the content column */
+    --bg:         #b3b3b3;   /* L70%, the content column */
+    --bg-elev:    #a4a4a4;   /* code backdrops */
+    --rule:       #888888;
+
+    --text:       #404040;   /* L25% */
+    --text-dim:   #5e5e5e;
+    --text-mute:  #7a7a7a;
+
+    --hover-bg:   #a0a0a0;
+
+    /* Thin grid line on the outer bg, desaturated mustard yellow,
+       semi-transparent so it reads as a quiet drafting-paper feel. */
+    --grid-line:  rgba(199, 173, 87, 0.32);
+
+    --w-running:  #0d492b;
+    --w-paused:   #463D6D;
+    --w-cream:    #E9E8E4;
+
+    /* Widget dither — direct port of widget.py NOISE_ALPHA_MAX_DARK=7,
+       NOISE_ALPHA_MAX_LIGHT=3 with seed 0xC0FFEE. 64×64 tile, native
+       pixel size (no rescaling). */
+    --widget-dither: url("data:image/png;base64,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");
+
+    /* Sharp pixel-dither grain, base64-embedded PNG. Sparse pixels
+       at low alpha so the texture is very subtle but not blurred.
+       Native pixel size; no rescaling, so each dot stays one
+       device pixel. */
+    --grain: url("data:image/png;base64,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");
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    color: var(--text);
+  }
+
+  body {
+    font-family: 'Inclusive Sans', ui-sans-serif, system-ui, -apple-system,
+                 'Segoe UI', sans-serif;
+    font-weight: 400;
+    font-size: 19px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+    background-color: var(--bg-outer);
+    background-image:
+      linear-gradient(to right,  var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* ---- Page layout ---------------------------------------------------
+   * Each section is its own .block with the cream-grey bg + grain.
+   * Between blocks there's a 5 px transparent gap, through which the
+   * outer dark grey + yellow grid pattern shows. */
+  .page {
+    max-width: 660px;
+    margin: 0 auto;
+    padding: 32px 0 0;
+  }
+
+  .block {
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(to top, rgba(0, 0, 0, 0.25) 30px, transparent 60px),
+      var(--grain);
+    background-size:     100% 60px, auto;
+    background-position: bottom,    top left;
+    background-repeat:   no-repeat, repeat;
+    image-rendering: pixelated;
+    padding: 24px 40px 60px;
+    border-radius: 25px 25px 0 0;
+  }
+  .block + .block {
+    /* Slide each block up under the previous one's tail. Default DOM
+       stacking puts later elements on top, so the later block covers
+       the lower part of the previous block's tail — but its rounded
+       top corners (carved away by border-radius) reveal the previous
+       block's darkening gradient, which completes the depth illusion. */
+    margin-top: -30px;
+  }
+  /* First block has more top padding so the greeting + title breathe. */
+  .block.hero {
+    padding-top: 48px;
+  }
+  /* Last block reaches the bottom edge of the viewport. Its own bottom
+     padding provides the two-empty-lines of breathing room below content. */
+  .block:last-child {
+    padding-bottom: 60px;
+  }
+
+  /* Greeting and farewell, same body font and size. */
+  .greeting, .farewell {
+    font-size: 19px;
+    line-height: 1.45;
+    color: var(--text);
+  }
+  .greeting { margin: 0 0 28px; }
+
+  /* ---- Headings (h1 only) ------------------------------------------- */
+  h1 {
+    font-size: 120px;
+    font-weight: 600;
+    letter-spacing: -0.04em;
+    line-height: 0.95;
+    margin: 0 0 40px;
+  }
+
+  .tagline {
+    color: var(--text);
+    font-size: 20px;
+    line-height: 1.55;
+    margin: 0 0 40px;
+    max-width: 540px;
+  }
+
+  p { margin: 0 0 18px; }
+  p:last-child { margin-bottom: 0; }
+  ul:last-child { margin-bottom: 0; }
+
+  /* Colored state words, reusable anywhere on the page. */
+  .c-run   { color: var(--w-running); }
+  .c-pause { color: var(--w-paused); }
+
+  /* ---- Inline emphasis ------------------------------------------------ */
+  code {
+    font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Consolas',
+                 monospace;
+    font-size: 16px;
+    color: var(--text);
+    background: var(--bg-elev);
+    border-radius: 4px;
+    padding: 1px 7px;
+  }
+
+  /* ---- Links: plain blue hyperlinks ---------------------------------- */
+  a {
+    color: #0044BB;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-thickness: 1px;
+    transition: color 150ms ease;
+  }
+  a:hover {
+    color: #002288;
+  }
+
+  /* ---- Lists ---------------------------------------------------------- */
+  ul {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 18px;
+  }
+  ul li {
+    padding: 4px 0;
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+  }
+  ul li::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 0.55em;
+  }
+  ul li:nth-child(odd)::before  { background-color: var(--w-running); }
+  ul li:nth-child(even)::before { background-color: var(--w-paused); }
+
+  /* ---- Widget demo ---------------------------------------------------- */
+  .demo {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+    margin: 32px 0 30px;
+  }
+
+  .widget {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background-color: var(--w-running);
+    background-image: var(--widget-dither);
+    background-repeat: repeat;
+    image-rendering: pixelated;
+    color: var(--w-cream);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    user-select: none;
+    cursor: pointer;
+    font-family: 'Uncut Sans', ui-sans-serif, sans-serif;
+    font-weight: 500;
+    font-size: 22px;
+    letter-spacing: 0.01em;
+    box-shadow:
+      0 0 0 1px rgba(0, 0, 0, 0.20),
+      0 4px 12px rgba(0, 0, 0, 0.18),
+      0 0 20px rgba(0, 0, 0, 0.06),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.25);
+    transition:
+      width 1000ms cubic-bezier(0.4, 0, 0.2, 1),
+      border-radius 1000ms cubic-bezier(0.4, 0, 0.2, 1),
+      background-color 700ms ease;
+  }
+
+  .widget:hover {
+    width: 74px;
+    border-radius: 13px;
+    transition:
+      width 700ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      border-radius 700ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      background-color 700ms ease;
+  }
+
+  .widget.paused { background-color: var(--w-paused); }
+
+  .widget .digits {
+    opacity: 0;
+    /* Direct port of widget.py GLOW_OFFSETS: 8 inner stamps at 1px
+       offsets (α=24/255≈0.094), 4 outer stamps at 2px orthogonal
+       offsets (α=10/255≈0.039). Blur radius 0 = sharp discrete copies,
+       same as the painter-path stamps. Cream colour matches the digit
+       base, reads as a soft LCD-glow edge rather than a coloured halo. */
+    text-shadow:
+      -1px  0    0 rgba(233, 232, 228, 0.094),
+       1px  0    0 rgba(233, 232, 228, 0.094),
+       0   -1px  0 rgba(233, 232, 228, 0.094),
+       0    1px  0 rgba(233, 232, 228, 0.094),
+      -1px -1px  0 rgba(233, 232, 228, 0.094),
+       1px -1px  0 rgba(233, 232, 228, 0.094),
+      -1px  1px  0 rgba(233, 232, 228, 0.094),
+       1px  1px  0 rgba(233, 232, 228, 0.094),
+      -2px  0    0 rgba(233, 232, 228, 0.039),
+       2px  0    0 rgba(233, 232, 228, 0.039),
+       0   -2px  0 rgba(233, 232, 228, 0.039),
+       0    2px  0 rgba(233, 232, 228, 0.039);
+    transition: opacity 200ms ease 0ms;
+  }
+  .widget:hover .digits {
+    opacity: 1;
+    transition: opacity 420ms ease 220ms;
+  }
+
+  /* ---- Footer --------------------------------------------------------- */
+  footer { margin: 0; }
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px 22px;
+    margin-bottom: 18px;
+  }
+  .micro {
+    font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Consolas',
+                 monospace;
+    font-size: 13px;
+    color: var(--text-mute);
+    letter-spacing: 0.04em;
+    margin: 0 0 6px;
+  }
+  .micro.signoff::before {
+    content: "// ";
+    color: var(--text-mute);
+  }
+  .micro.signoff { margin-bottom: 0; }
+
+  /* ---- Narrow viewport ----------------------------------------------- */
+  @media (max-width: 480px) {
+    .page   { padding: 20px 0 36px; }
+    .block  { padding: 20px 22px; }
+    .block.hero { padding-top: 36px; padding-bottom: 24px; }
+    h1      { font-size: 76px; }
+    body    { font-size: 17px; }
+    .greeting, .farewell { font-size: 17px; }
+  }
+</style>
+</head>
+<body>
+<main class="page">
+
+  <section class="block hero">
+    <div class="greeting">Hi there,<br>let me introduce you to</div>
+    <h1>Tranqli</h1>
+    <p class="tagline">A quiet desktop time tracker.<br>No account, cloud, or analytics.</p>
+    <div class="demo">
+      <div class="widget" aria-label="Tranqli widget, hover to expand, click to toggle state">
+        <span class="digits">01:17</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <p>Tranqli is a small rounded widget that floats above your other windows. One click starts it. Another pauses. Another resumes. Drag it anywhere. The color tells you what state it's in. The time only appears when your mouse hovers over the widget.</p>
+    <p>No notifications. No dashboards. No analytics. No account. Your data stays on your machine. No cross-device sync.</p>
+    <p>ADHD friendly.</p>
+  </section>
+
+  <section class="block">
+    <ul>
+      <li>Left-click:<span class="c-run">start</span>,<span class="c-pause">pause</span>,<span class="c-run">resume</span>.</li>
+      <li>Right-click: open the menu (set tag, save session, color scheme, archive).</li>
+      <li>Drag: move it anywhere. Tranqli remembers where you put it.</li>
+      <li>Hover: peek at the recorded time.</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <p>A session is one tag on one day. Tags are yours to invent. Name them however helps you organize. Tracking the same tag on the same day twice just adds to the existing one, no duplicates.</p>
+    <p>To rename, retag, or clean things up, there's a small local web page (Edit data (web) in the right-click menu). The archive view groups everything by year and month with totals per tag.</p>
+  </section>
+
+  <section class="block">
+    <p>When your computer sleeps, Tranqli sleeps too. That time doesn't get counted. You don't have to think about it.</p>
+  </section>
+
+  <section class="block">
+    <p>Six color schemes in the right-click menu: Earthen, Twilight, Blossom, Espresso, Hearth, Steel. Three sizes too: small, medium, large.</p>
+  </section>
+
+  <section class="block">
+    <p>Everything's saved in a simple CSV file on your computer (<code>%APPDATA%\Tranqli\sessions.csv</code>). Open it in Excel, a text editor, or the local web page above.</p>
+  </section>
+
+  <section class="block">
+    <ul>
+      <li>No popup notifications.</li>
+      <li>No tracking. No servers. No accounts. Your data never leaves your computer.</li>
+      <li>No "AI-powered insights". It just counts minutes.</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <footer>
+      <div class="links">
+        <a href="https://github.com/martins-fyi/tranqli/releases/latest/download/Tranqli-Setup-0.1.0.exe">download</a>
+        <a href="https://github.com/martins-fyi/tranqli">github</a>
+        <a href="https://github.com/martins-fyi/tranqli/releases">release notes</a>
+        <a href="https://github.com/martins-fyi/tranqli/issues">issues</a>
+      </div>
+      <p class="micro">windows today, macos in progress</p>
+      <p class="micro signoff">made by <a href="https://martins.fyi">martins</a> · <a href="https://opensource.org/license/mit/">mit</a> · 2026</p>
+    </footer>
+  </section>
+
+  <section class="block">
+    <div class="farewell">Have a nice day.</div>
+  </section>
+
+</main>
+
+<script>
+  // Click toggles the widget between running (green) and paused
+  // (purple). Hover behaviour stays in CSS.
+  document.querySelectorAll('.widget').forEach(w => {
+    w.addEventListener('click', () => {
+      w.classList.toggle('paused');
+    });
+  });
+</script>
+</body>
+</html>
