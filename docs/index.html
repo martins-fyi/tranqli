@@ -289,9 +289,16 @@
 
   /* ---- Narrow viewport ----------------------------------------------- */
   @media (max-width: 480px) {
-    .page   { padding: 20px 0 36px; }
-    .block  { padding: 20px 22px; }
-    .block.hero { padding-top: 36px; padding-bottom: 24px; }
+    .page   { padding: 20px 0 0; }
+    /* 4-value padding so the 72px bottom is explicit. With the next
+       block's -30px overlap, content ends 42px above where the next
+       block's rounded top edge cuts in — enough breathing room that
+       the last line never feels like it's bumping the next card. */
+    .block  { padding: 24px 24px 72px 24px; }
+    /* Hero just gets more top breath; bottom inherits the 72px above. */
+    .block.hero { padding-top: 40px; }
+    /* Last block keeps its desktop trailing-line space. */
+    .block:last-child { padding-bottom: 60px; }
     h1      { font-size: 76px; }
     body    { font-size: 17px; }
     .greeting, .farewell { font-size: 17px; }
