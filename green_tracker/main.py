@@ -677,6 +677,8 @@ class App:
             undo=self.on_undo,
             prompt_new_tag=self.on_prompt_new_tag,
             rename_tag=self.on_rename_tag,
+            delete_tag=self.on_delete_tag,
+            merge_tags=self.on_merge_tags,
             add_record=self.on_add_record,
             rename_session=self.on_rename_session,
             retime_session=self.on_retime_session,
@@ -1432,6 +1434,133 @@ class App:
         self._session_started = True
         self._update_running_state()
 
+    def _tag_has_live_unsaved_session(self, tag: str) -> bool:
+        """Is `tag` the tag of an in-progress session with unbanked time?
+
+        The §4 safety condition for delete and merge: not merely "is this
+        tag active" but "would acting on it destroy or move time that is
+        only on the clock". A tag sitting active with nothing accumulated
+        has nothing to lose.
+        """
+        return self.tracker.tag == tag and self._has_active_session()
+
+    def on_delete_tag(self, tag: str) -> None:
+        """Delete a tag and all its history (§4).
+
+        Two confirmations, deliberately: the live-session warning is about
+        time that exists nowhere else yet, while the ordinary confirmation
+        is about stored rows. They are different losses and collapsing
+        them into one dialog would bury the worse of the two.
+
+        The spec offers "save first, or cancel" here. Save first is not
+        offered for delete, because it does not help: banking the session
+        writes a row for this tag, and the delete then removes every row
+        for this tag — including the one just written. The user would be
+        told their work was saved and it would be gone regardless. The
+        honest choice is to state that the in-progress session dies with
+        the tag, and let them cancel. Merge, where saving genuinely does
+        preserve the time, does offer it.
+        """
+        rows = [s for s in storage.load_sessions() if s.tag == tag]
+        if self._tag_has_live_unsaved_session(tag):
+            elapsed = _format_dhm(
+                _seconds_to_minutes(self.tracker.elapsed_seconds()),
+            )
+            reply = QMessageBox.question(
+                self.widget, "Delete tag",
+                f"'{tag}' is the tag of your session in progress "
+                f"({elapsed} not yet saved).\n\n"
+                f"Deleting '{tag}' removes its {len(rows)} stored "
+                f"session(s) and discards the one in progress. The "
+                f"in-progress time cannot be recovered by Undo.\n\n"
+                f"Delete anyway?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        else:
+            reply = QMessageBox.question(
+                self.widget, "Delete tag",
+                f"Delete '{tag}' and its {len(rows)} stored session(s)?\n\n"
+                f"This can be reversed with Undo.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        storage.delete_tag(tag)
+        storage.forget_tag_in_config(self.config, tag)
+        storage.save_config(self.config)
+
+        # A tracker left pointing at a deleted tag would recreate it on
+        # the next save — the deletion would appear to undo itself.
+        if self.tracker.tag == tag:
+            self.tracker.reset()
+            self._session_started = False
+            self._carry_seconds = 0
+            storage.clear_active_snapshot()
+            self._update_running_state()
+        self._refresh_carry_from_storage()
+
+    def on_merge_tags(self, absorbed: str) -> None:
+        """Merge `absorbed` into a target tag chosen by the user (§4).
+
+        Invoked from the absorbed tag's own menu entry, so that tag is
+        fixed and the target is picked — the dialog says so explicitly,
+        because merging the wrong way round destroys the wrong name and
+        the direction is not recoverable from the result.
+
+        Unlike delete, saving first is offered and does help: the banked
+        time lands on `absorbed`, and the merge then folds it into the
+        target along with everything else.
+        """
+        others = sorted(t for t in storage.tag_totals() if t != absorbed)
+        if not others:
+            QMessageBox.information(
+                self.widget, "Merge tags",
+                f"'{absorbed}' is the only tag — nothing to merge into.",
+            )
+            return
+
+        target, ok = QInputDialog.getItem(
+            self.widget, "Merge tags",
+            f"Merge '{absorbed}' into which tag?\n"
+            f"'{absorbed}' is absorbed and disappears; its time moves "
+            f"to the tag you pick.",
+            others, 0, editable=False,
+        )
+        if not ok or not target:
+            return
+
+        if self._tag_has_live_unsaved_session(absorbed):
+            elapsed = _format_dhm(
+                _seconds_to_minutes(self.tracker.elapsed_seconds()),
+            )
+            reply = QMessageBox.question(
+                self.widget, "Merge tags",
+                f"'{absorbed}' has a session in progress ({elapsed} not "
+                f"yet saved).\n\n"
+                f"Save it before merging, so it moves to '{target}' too?",
+                QMessageBox.Save | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply != QMessageBox.Save:
+                return
+            self.on_save_session()
+
+        if not storage.merge_tags(target, absorbed):
+            return
+        storage.rename_tag_in_config(self.config, absorbed, target)
+        storage.save_config(self.config)
+
+        # Same reasoning as rename: the absorbed name no longer exists,
+        # so a tracker still on it would resurrect it on the next save.
+        if self.tracker.tag == absorbed:
+            self.tracker.set_tag(target)
+        self._refresh_carry_from_storage()
+
     def on_undo(self) -> None:
         """Undo the last CSV mutation (spec §5).
 
@@ -1537,7 +1666,7 @@ class App:
         # The MRU follows the rename whether or not the renamed tag is
         # the live one — otherwise the picker keeps offering a name that
         # no longer exists in storage.
-        storage.rename_recent_tag(self.config, old_tag, new_tag)
+        storage.rename_tag_in_config(self.config, old_tag, new_tag)
         storage.save_config(self.config)
 
         # Re-point the live tracker if it was using the old tag.
@@ -2310,7 +2439,7 @@ class App:
         if affected:
             # The MRU follows the rename regardless of what's live, so
             # the picker can't keep offering the old name.
-            storage.rename_recent_tag(self.config, old_tag, new_tag)
+            storage.rename_tag_in_config(self.config, old_tag, new_tag)
             storage.save_config(self.config)
             # The active tracker tag itself may have been renamed; if
             # so, re-point it before re-seeding the carry.

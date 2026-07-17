@@ -15,14 +15,17 @@ from green_tracker.storage import (
     clear_undo_stack,
     commit_session,
     delete_session,
+    delete_tag,
+    forget_tag_in_config,
     format_tag_total,
     get_config_path,
     get_csv_path,
     load_config,
     load_sessions,
     merge_into,
+    merge_tags,
     push_recent_tag,
-    rename_recent_tag,
+    rename_tag_in_config,
     rename_session,
     rename_tag,
     retag_session,
@@ -657,37 +660,37 @@ class TestRenameRecentTag:
     def test_rename_preserves_position(self):
         # A rename is not a use — it must not jump to the front.
         config = {"recent_tags": ["admin", "work", "reading"]}
-        rename_recent_tag(config, "work", "employment")
+        rename_tag_in_config(config, "work", "employment")
         assert config["recent_tags"] == ["admin", "employment", "reading"]
 
     def test_rename_updates_mirrored_last_tag(self):
         config = {"recent_tags": ["work", "admin"], "last_tag": "work"}
-        rename_recent_tag(config, "work", "employment")
+        rename_tag_in_config(config, "work", "employment")
         assert config["last_tag"] == "employment"
         assert config["last_tag"] == config["recent_tags"][0]
 
     def test_rename_of_inactive_tag_leaves_last_tag_alone(self):
         config = {"recent_tags": ["admin", "work"], "last_tag": "admin"}
-        rename_recent_tag(config, "work", "employment")
+        rename_tag_in_config(config, "work", "employment")
         assert config["last_tag"] == "admin"
         assert config["recent_tags"] == ["admin", "employment"]
 
     def test_rename_onto_existing_name_merges_keeping_recent_position(self):
         # Mirrors storage.rename_tag folding colliding rows together.
         config = {"recent_tags": ["admin", "work", "reading"]}
-        rename_recent_tag(config, "reading", "admin")
+        rename_tag_in_config(config, "reading", "admin")
         assert config["recent_tags"] == ["admin", "work"]
 
     def test_rename_of_absent_tag_is_a_noop(self):
         config = {"recent_tags": ["admin", "work"], "last_tag": "admin"}
-        rename_recent_tag(config, "nosuch", "other")
+        rename_tag_in_config(config, "nosuch", "other")
         assert config["recent_tags"] == ["admin", "work"]
         assert config["last_tag"] == "admin"
 
     def test_degenerate_input_is_a_noop(self):
         for old, new in (("", "x"), ("x", ""), ("same", "same"), (None, "x")):
             config = {"recent_tags": ["admin"], "last_tag": "admin"}
-            rename_recent_tag(config, old, new)
+            rename_tag_in_config(config, old, new)
             assert config["recent_tags"] == ["admin"]
             assert config["last_tag"] == "admin"
 
@@ -697,11 +700,151 @@ class TestRenameRecentTag:
         save_sessions([SessionRow("2026-05-28", "work", "w-1", 60)])
         config = {"recent_tags": ["work"], "last_tag": "work"}
         assert rename_tag("work", "employment") is True
-        rename_recent_tag(config, "work", "employment")
+        rename_tag_in_config(config, "work", "employment")
         stored = {r.tag for r in load_sessions()}
         assert "work" not in stored
         assert "work" not in config["recent_tags"]
         assert config["recent_tags"] == ["employment"]
+
+
+# ---------------------------------------------------------------------------
+# delete_tag / merge_tags (spec §4)
+# ---------------------------------------------------------------------------
+
+class TestDeleteTag:
+    def test_removes_only_that_tags_rows(self):
+        save_sessions([
+            SessionRow("2026-05-28", "work", "w-1", 60),
+            SessionRow("2026-05-29", "work", "w-2", 30),
+            SessionRow("2026-05-28", "admin", "a-1", 15),
+        ])
+        assert delete_tag("work") == 2
+        assert [r.tag for r in load_sessions()] == ["admin"]
+
+    def test_unknown_tag_is_a_noop(self):
+        save_sessions([SessionRow("2026-05-28", "work", "w-1", 60)])
+        clear_undo_stack()
+        assert delete_tag("nosuch") == 0
+        assert len(load_sessions()) == 1
+        assert undo_depth() == 0     # a no-op must not burn an undo slot
+
+    def test_blank_tag_is_a_noop(self):
+        save_sessions([SessionRow("2026-05-28", "work", "w-1", 60)])
+        clear_undo_stack()
+        for blank in ("", "   ", None):
+            assert delete_tag(blank) == 0
+        assert undo_depth() == 0
+
+    def test_is_undoable(self):
+        rows = [
+            SessionRow("2026-05-28", "work", "w-1", 60),
+            SessionRow("2026-05-28", "admin", "a-1", 15),
+        ]
+        save_sessions(rows)
+        clear_undo_stack()
+        delete_tag("work")
+        assert undo() is True
+        assert load_sessions() == rows
+
+
+class TestMergeTags:
+    def test_absorbed_rows_move_to_target(self):
+        save_sessions([
+            SessionRow("2026-05-28", "work", "w-1", 60),
+            SessionRow("2026-05-29", "old", "o-1", 30),
+        ])
+        assert merge_tags("work", "old") is True
+        rows = load_sessions()
+        assert {r.tag for r in rows} == {"work"}
+        assert sorted(r.minutes for r in rows) == [30, 60]
+
+    def test_same_date_collision_sums_into_target(self):
+        # §4: "if a (A, date) row already exists for a date B also has,
+        # sum the minutes into A's row and drop B's row"
+        save_sessions([
+            SessionRow("2026-05-28", "work", "w-1", 60),
+            SessionRow("2026-05-28", "old", "o-1", 30),
+        ])
+        assert merge_tags("work", "old") is True
+        rows = load_sessions()
+        assert len(rows) == 1
+        assert rows[0].tag == "work"
+        assert rows[0].minutes == 90
+
+    def test_direction_absorbed_disappears_not_target(self):
+        # The argument order is the whole risk here: merging backwards
+        # destroys the wrong name.
+        save_sessions([
+            SessionRow("2026-05-28", "keep", "k-1", 60),
+            SessionRow("2026-05-28", "gone", "g-1", 30),
+        ])
+        merge_tags("keep", "gone")
+        assert {r.tag for r in load_sessions()} == {"keep"}
+
+    def test_unknown_absorbed_tag_is_a_noop(self):
+        save_sessions([SessionRow("2026-05-28", "work", "w-1", 60)])
+        clear_undo_stack()
+        assert merge_tags("work", "nosuch") is False
+        assert undo_depth() == 0
+
+    def test_is_undoable(self):
+        rows = [
+            SessionRow("2026-05-28", "work", "w-1", 60),
+            SessionRow("2026-05-28", "old", "o-1", 30),
+        ]
+        save_sessions(rows)
+        clear_undo_stack()
+        merge_tags("work", "old")
+        assert undo() is True
+        assert load_sessions() == rows
+
+
+class TestForgetTagInConfig:
+    def test_removes_from_mru_and_schemes(self):
+        config = {
+            "recent_tags": ["admin", "work", "reading"],
+            "tag_schemes": {"work": "Earthen", "admin": "Twilight"},
+            "last_tag": "admin",
+        }
+        forget_tag_in_config(config, "work")
+        assert config["recent_tags"] == ["admin", "reading"]
+        assert config["tag_schemes"] == {"admin": "Twilight"}
+        assert config["last_tag"] == "admin"
+
+    def test_last_tag_falls_back_to_new_most_recent(self):
+        config = {"recent_tags": ["work", "admin"], "last_tag": "work"}
+        forget_tag_in_config(config, "work")
+        assert config["recent_tags"] == ["admin"]
+        assert config["last_tag"] == "admin"   # mirror still holds
+
+    def test_last_tag_dropped_when_nothing_remains(self):
+        config = {"recent_tags": ["work"], "last_tag": "work"}
+        forget_tag_in_config(config, "work")
+        assert config["recent_tags"] == []
+        assert "last_tag" not in config        # must not outlive the MRU
+
+    def test_unknown_tag_is_a_noop(self):
+        config = {"recent_tags": ["work"], "last_tag": "work"}
+        forget_tag_in_config(config, "nosuch")
+        assert config["recent_tags"] == ["work"]
+        assert config["last_tag"] == "work"
+
+
+class TestRenameTagInConfigSchemes:
+    def test_scheme_follows_the_rename(self):
+        config = {"recent_tags": ["work"], "tag_schemes": {"work": "Earthen"}}
+        rename_tag_in_config(config, "work", "employment")
+        assert config["tag_schemes"] == {"employment": "Earthen"}
+
+    def test_merge_keeps_the_targets_own_scheme(self):
+        # Merging 'old' into 'work': work's scheme is the surviving one.
+        config = {
+            "recent_tags": ["work", "old"],
+            "tag_schemes": {"work": "Earthen", "old": "Twilight"},
+        }
+        rename_tag_in_config(config, "old", "work")
+        assert config["tag_schemes"] == {"work": "Earthen"}
+        assert config["recent_tags"] == ["work"]
 
 
 # ---------------------------------------------------------------------------

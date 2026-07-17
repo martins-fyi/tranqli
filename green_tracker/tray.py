@@ -95,6 +95,8 @@ class MenuContext:
     new_tag:          Callable[[], None]             # free-text entry, then switch to it
     prompt_new_tag:   Callable[[], None]             # main.py opens input dialog
     rename_tag:       Callable[[str], None]          # main.py prompts for new name
+    delete_tag:       Callable[[str], None]          # main.py confirms, then deletes
+    merge_tags:       Callable[[str], None]          # arg is the ABSORBED tag
     add_record:       Callable[[str], None]          # main.py opens AddRecordDialog
     rename_session:   Callable[[], None]             # rename current in-progress session
     retime_session:   Callable[[], None]             # retime current in-progress session
@@ -203,8 +205,12 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     retag_menu.setEnabled(active and bool(tags))
 
     # Tag Edit ▸ — per-tag actions nested under each tag's label, which
-    # shows its lifetime total ("work    01h 30m"). Delete tag… and Merge
-    # tags… join them in phase 5 (§4).
+    # shows its lifetime total ("work    01h 30m").
+    #
+    # Per-tag rather than §3's flat Rename…/Delete…/Merge… list: the tag
+    # is already chosen by the time you reach the action, so none of them
+    # has to open a "which tag?" picker first, and none can act on a tag
+    # you didn't mean. Merge still prompts, but only for its target.
     #
     # Edit actions only — no "click tag = set as active" gesture. Picking
     # a tag to work on is Switch Tags; correcting the current session's
@@ -214,8 +220,18 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
         label = f"{tag}    {tags[tag]}"
         tag_submenu = edit_menu.addMenu(label)
         tag_submenu.addAction(
-            "Rename tag", lambda t=tag: ctx.rename_tag(t),
+            "Rename tag…", lambda t=tag: ctx.rename_tag(t),
         )
+        # Destructive pair kept together and below Rename, so neither is
+        # adjacent to the harmless actions underneath. merge_tags takes
+        # the ABSORBED tag — this one — and asks for the target.
+        tag_submenu.addAction(
+            "Delete tag…", lambda t=tag: ctx.delete_tag(t),
+        )
+        tag_submenu.addAction(
+            "Merge tags…", lambda t=tag: ctx.merge_tags(t),
+        )
+        tag_submenu.addSeparator()
         tag_submenu.addAction(
             "Add record", lambda t=tag: ctx.add_record(t),
         )

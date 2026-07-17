@@ -511,6 +511,46 @@ def retag_session(session_name: str, new_tag: str) -> bool:
         return True
 
 
+def delete_tag(tag: str) -> int:
+    """Remove every row carrying `tag`. Returns the number dropped.
+
+    Deletes stored history only. The caller owns the live session: a
+    tracker still pointing at a deleted tag will recreate it on the next
+    save, so main.py resets the tracker when it deletes the tag it is on.
+
+    No-ops cleanly on blank input or an unknown tag, returning 0 without
+    touching storage — and so without burning an undo slot.
+    """
+    tag = (tag or "").strip()
+    if not tag:
+        return 0
+    with _csv_lock:
+        sessions = load_sessions()
+        kept = [row for row in sessions if row.tag != tag]
+        removed = len(sessions) - len(kept)
+        if removed:
+            save_sessions(kept)
+        return removed
+
+
+def merge_tags(target: str, absorbed: str) -> bool:
+    """Fold `absorbed`'s rows into `target`. Returns True if anything moved.
+
+    A merge is a rename that happens to land on an existing name, so this
+    is rename_tag with the arguments named for intent. Everything §4 asks
+    of merge, rename_tag already does: rows are rewritten to the target,
+    and where both tags have a row on the same date the minutes are summed
+    into the target's row and the absorbed one dropped — the same
+    merge-on-save semantics used everywhere else.
+
+    Kept as its own name because `merge_tags(target, absorbed)` and
+    `rename_tag(old, new)` read in opposite directions, and calling the
+    two-way operation by the wrong name at a call site is how you merge
+    backwards and lose the wrong tag.
+    """
+    return rename_tag(absorbed, target)
+
+
 def rename_tag(old_tag: str, new_tag: str) -> bool:
     """Rename a tag across ALL stored sessions. Returns True if at
     least one row was affected (renamed or merged).
@@ -737,17 +777,18 @@ def push_recent_tag(config: dict, tag: str) -> None:
     config["last_tag"] = tag
 
 
-def rename_recent_tag(config: dict, old_tag: str, new_tag: str) -> None:
-    """Follow a tag rename through the MRU, preserving its position.
+def rename_tag_in_config(config: dict, old_tag: str, new_tag: str) -> None:
+    """Follow a tag rename through the MRU and per-tag scheme (§4).
 
     A rename is not a use: the tag keeps its place in the order rather
     than jumping to the front. Without this the MRU would keep offering
     a name that no longer exists in the CSV, and last_tag would drift
     away from recent_tags[0] the moment the active tag was renamed.
 
-    If the new name is already present, the two entries merge and the
-    earlier (more recent) position wins — mirroring the way rename_tag
-    folds colliding rows together in storage.
+    Also covers merge, which is a rename onto an existing name. Where
+    both names are already present the entries fold together, the earlier
+    (more recent) position wins, and the target keeps its own scheme —
+    mirroring the way rename_tag folds colliding rows into the target.
     """
     old_tag = (old_tag or "").strip()
     new_tag = (new_tag or "").strip()
@@ -764,8 +805,46 @@ def rename_recent_tag(config: dict, old_tag: str, new_tag: str) -> None:
             deduped.append(t)
     config["recent_tags"] = deduped[:RECENT_TAGS_MAX]
 
+    schemes = config.get("tag_schemes")
+    if isinstance(schemes, dict) and old_tag in schemes:
+        # setdefault, not assignment: on a merge the target's own scheme
+        # is the surviving one, and the absorbed tag must not overwrite it.
+        schemes.setdefault(new_tag, schemes.pop(old_tag))
+
     if (config.get("last_tag") or "").strip() == old_tag:
         config["last_tag"] = new_tag
+
+
+def forget_tag_in_config(config: dict, tag: str) -> None:
+    """Drop a tag from the MRU and per-tag schemes (§4 delete / merge).
+
+    For a tag that no longer exists: deleted outright, or absorbed by a
+    merge. Leaving it behind would keep the picker offering a name with
+    no history, and phase 7 would keep a scheme for a tag that cannot be
+    picked.
+
+    last_tag falls back to whatever is now most recent, or goes away
+    entirely if nothing is left — it mirrors recent_tags[0], so it cannot
+    be allowed to outlive the entry it mirrors.
+    """
+    tag = (tag or "").strip()
+    if not tag:
+        return
+
+    config["recent_tags"] = [
+        t for t in config.get("recent_tags", []) if t != tag
+    ]
+
+    schemes = config.get("tag_schemes")
+    if isinstance(schemes, dict):
+        schemes.pop(tag, None)
+
+    if (config.get("last_tag") or "").strip() == tag:
+        recent = config["recent_tags"]
+        if recent:
+            config["last_tag"] = recent[0]
+        else:
+            config.pop("last_tag", None)
 
 
 # ------------------------------------------------------------------
