@@ -661,12 +661,18 @@ class App:
             # reads the menu's smaller d-field as "way less total"
             # even though the underlying minutes are identical.
             tag_lifetimes=self._get_tag_lifetimes,
+            # Read from config on each menu build rather than captured
+            # once — the MRU reorders on every switch, and a stale list
+            # would show the wrong five in the wrong order.
+            recent_tags=lambda: self.config.get("recent_tags", []),
+            current_tag=lambda: self.tracker.tag,
             has_active_session=self._has_active_session,
             is_running=lambda: self.tracker.state == State.RUNNING,
             save_session=self.on_save_session,
             new_session=self.on_new_session,
             set_tag=self.on_set_tag,
             switch_tag=self.on_switch_tag,
+            new_tag=self.on_new_tag,
             prompt_new_tag=self.on_prompt_new_tag,
             rename_tag=self.on_rename_tag,
             add_record=self.on_add_record,
@@ -1407,13 +1413,46 @@ class App:
         _session_started stays True so the next left-click starts the new
         tag straight away rather than re-opening the picker (§2b) — the
         user has just chosen a tag; asking again would be noise.
+
+        Picking the tag already running is a no-op. It is the checked
+        entry in the picker, so it is easy to click by reflex, and the
+        honest reading of "switch to what I'm already on" is "nothing to
+        do". Banking and rebinding would stop a running clock and reset
+        it to 00:00 — indistinguishable from a bug.
         """
+        if tag == self.tracker.tag:
+            return
+
         if self.tracker.tag is not None and self._has_active_session():
             self.on_save_session()
 
         self.on_set_tag(tag)
         self._session_started = True
         self._update_running_state()
+
+    def on_new_tag(self) -> None:
+        """"New tag…" in the picker: free-text entry, then switch to it.
+
+        The only way to create a tag from the widget once tags already
+        exist — _pick_session_tag's free-text branch is reachable only on
+        a first-ever run, and everything else offers existing tags only.
+        Until now the answer was "add it in the web editor", which is a
+        detour when the point is to start working on something new.
+
+        The tag needs no separate registration: tags are implicit, defined
+        by whatever strings exist in the CSV's tag column (spec §1), so
+        switching to a new name and tracking against it is what brings it
+        into being. Nothing is written until the session is saved.
+        """
+        text, ok = QInputDialog.getText(
+            self.widget, "New tag", "Tag name:",
+        )
+        if not ok:
+            return
+        text = text.strip()
+        if not text:
+            return
+        self.on_switch_tag(text)
 
     def on_prompt_new_tag(self) -> None:
         """Prompt to set the tag — delegates to the start-of-session picker.

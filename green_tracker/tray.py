@@ -42,7 +42,7 @@ Two fields look interchangeable and are not:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
 from PySide6.QtGui import (
@@ -51,6 +51,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from .widget import COLOR_SCHEMES, make_scheme_icon
+
+# How many of the MRU's tags the Switch task picker shows (spec §3).
+# Storage retains RECENT_TAGS_MAX (20) — deliberately more than this, so
+# the picker stays short while More… still has history behind it.
+_RECENT_TAGS_SHOWN = 5
 
 
 # Tray icon — colours are 25% brighter than the widget's running/paused
@@ -76,7 +81,9 @@ class MenuContext:
     current_shape:      Callable[[], str]            # "rect"  | "circle"
     elapsed_seconds:    Callable[[], float]          # tracker's live elapsed
     tag_lifetimes:      Callable[[], Mapping[str, str]]  # tag -> "02d 02h"
-    has_active_session: Callable[[], bool]           # gates Save / Set tag
+    recent_tags:        Callable[[], Sequence[str]]  # MRU order, most-recent first
+    current_tag:        Callable[[], Optional[str]]  # active tag, None if no session
+    has_active_session: Callable[[], bool]           # gates Save / Retag session
     is_running:         Callable[[], bool]           # drives Save vs Stop&Save label
 
     # ---- Action callbacks ------------------------------------------------
@@ -84,6 +91,7 @@ class MenuContext:
     new_session:      Callable[[], None]             # main.py prompts to save first
     set_tag:          Callable[[str], None]          # "Retag session" — rebind, keep time
     switch_tag:       Callable[[str], None]          # "Switch task" — bank time, then rebind
+    new_tag:          Callable[[], None]             # free-text entry, then switch to it
     prompt_new_tag:   Callable[[], None]             # main.py opens input dialog
     rename_tag:       Callable[[str], None]          # main.py prompts for new name
     add_record:       Callable[[str], None]          # main.py opens AddRecordDialog
@@ -129,18 +137,42 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # the tracker so the next widget click re-opens the tag picker.
     menu.addAction("New session", ctx.new_session)
 
-    # --- Switch task (submenu: existing tags only — new tags via web UI) --
-    # Banks the current tag's time, then starts the picked tag fresh at
-    # 00:00, PAUSED (spec §2c). Always available: switching with nothing
-    # running is just picking what to work on next.
+    # --- Switch task — spec §3's "Tags ▸" picker --------------------------
+    # The N most-recent tags in MRU order, current one checked, then
+    # New tag… and More…. Banks the current tag's time and starts the
+    # picked one fresh at 00:00 PAUSED (§2c).
+    #
+    # MRU rather than the old alphabetical list of every tag: the tags you
+    # switch between are the ones you just used, and an alphabetical list
+    # buries them among every tag you have ever created. Storage keeps
+    # more than this (RECENT_TAGS_MAX) so More… has history to draw on.
+    #
+    # Always enabled — switching with nothing running is just picking what
+    # to work on next, and New tag… must stay reachable with no tags at
+    # all, which is the first-run case (§2a).
     switch_task_menu = menu.addMenu("Switch task")
-    if tags:
-        for tag in sorted(tags.keys()):
+    recent = list(ctx.recent_tags())[:_RECENT_TAGS_SHOWN]
+    if recent:
+        current = ctx.current_tag()
+        # Exclusive group so the checkmark reads as "this is the one
+        # you're on", matching the Size and Color schemes menus below.
+        switch_group = QActionGroup(switch_task_menu)
+        switch_group.setExclusive(True)
+        for tag in recent:
+            a = switch_task_menu.addAction(tag)
+            a.setCheckable(True)
+            a.setChecked(tag == current)
             # `t=tag` defaults the lambda's free var so each closure binds
             # its own tag — without this, every lambda would capture the
-            # final loop value (Python closure-in-loop gotcha).
-            switch_task_menu.addAction(tag, lambda t=tag: ctx.switch_tag(t))
-    switch_task_menu.setEnabled(bool(tags))
+            # final loop value (Python closure-in-loop gotcha). `_checked`
+            # absorbs the bool that triggered emits for checkable actions.
+            a.triggered.connect(
+                lambda _checked=False, t=tag: ctx.switch_tag(t),
+            )
+            switch_group.addAction(a)
+        switch_task_menu.addSeparator()
+    switch_task_menu.addAction("New tag…", ctx.new_tag)
+    switch_task_menu.addAction("More…", ctx.open_archive)
 
     # --- Retag session (submenu: existing tags only) ----------------------
     # Corrects which tag the *current* session belongs to, carrying its
@@ -153,15 +185,17 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
             retag_menu.addAction(tag, lambda t=tag: ctx.set_tag(t))
     retag_menu.setEnabled(active and bool(tags))
 
-    # --- Tags submenu — per-tag actions nested under each tag's label.
+    # --- Tags edit — per-tag actions nested under each tag's label.
     # Label shows lifetime total ("work    01h 30m"). Opening a tag's
     # entry reveals three actions: Rename tag, Add record, Open Archive.
-    # The old "click tag = set as active" gesture is gone — picking a tag
-    # to work on is "Switch task" above; correcting the current session's
-    # tag is "Retag session". This submenu is edit actions only, and is
-    # what spec §3 turns into "Tags edit ▸" in phase 4.
+    # Delete tag… and Merge tags… join them in phase 5 (§4).
+    #
+    # Edit actions only — no "click tag = set as active" gesture. Picking
+    # a tag to work on is "Switch task" above; correcting the current
+    # session's tag is "Retag session". The name says which this is, so
+    # the three tag menus can't be mistaken for one another.
     if tags:
-        tags_menu = menu.addMenu("Tags")
+        tags_menu = menu.addMenu("Tags edit")
         for tag in sorted(tags.keys()):
             label = f"{tag}    {tags[tag]}"
             tag_submenu = tags_menu.addMenu(label)
