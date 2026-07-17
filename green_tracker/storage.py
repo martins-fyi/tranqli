@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -144,13 +145,53 @@ def load_sessions() -> list[SessionRow]:
         ]
 
 
-def save_sessions(sessions: list[SessionRow]) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write `data` to `path` crash-safely (brief §10).
+
+    Writes a sibling .tmp then os.replace()s it onto the target. The
+    rename is atomic within a filesystem, and the tmp is a sibling so
+    the two are always on the same one. A kill mid-write leaves the
+    original wholly intact rather than truncated — which a plain
+    open("w") cannot promise, since it zeroes the file on open and any
+    interruption before the rows are flushed takes the history with it.
+    """
     _ensure_dir()
-    with get_csv_path().open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        for row in sessions:
-            writer.writerow(row._asdict())
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except OSError:
+        # Don't leave a half-written .tmp behind to confuse the next
+        # write (or the user looking at the data dir).
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _serialize_sessions(sessions: list[SessionRow]) -> bytes:
+    """Render rows as the CSV file's exact on-disk bytes."""
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=FIELDNAMES)
+    writer.writeheader()
+    for row in sessions:
+        writer.writerow(row._asdict())
+    return buf.getvalue().encode("utf-8")
+
+
+def _write_sessions(sessions: list[SessionRow]) -> None:
+    """Persist rows without touching the undo stack.
+
+    Split from save_sessions so undo() can restore a snapshot through
+    the same crash-safe path without its own restore being recorded as
+    a fresh undoable mutation.
+    """
+    _atomic_write_bytes(get_csv_path(), _serialize_sessions(sessions))
+
+
+def save_sessions(sessions: list[SessionRow]) -> None:
+    _write_sessions(sessions)
 
 
 # ------------------------------------------------------------------

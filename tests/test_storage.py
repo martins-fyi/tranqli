@@ -1,15 +1,18 @@
 import json
+import os
 
 import pytest
 
 from green_tracker.storage import (
     CURRENT_CONFIG_VERSION,
+    FIELDNAMES,
     RECENT_TAGS_MAX,
     SessionRow,
     commit_session,
     delete_session,
     format_tag_total,
     get_config_path,
+    get_csv_path,
     load_config,
     load_sessions,
     merge_into,
@@ -18,6 +21,11 @@ from green_tracker.storage import (
     save_sessions,
     tag_totals,
 )
+
+
+def _tmp_path_for(path):
+    """The sibling .tmp the atomic writer stages through."""
+    return path.with_suffix(path.suffix + ".tmp")
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +162,68 @@ class TestCSVIO:
         loaded = load_sessions()
         assert loaded[0].minutes == 75
         assert isinstance(loaded[0].minutes, int)
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe CSV write (brief §10)
+# ---------------------------------------------------------------------------
+
+class TestAtomicSessionWrite:
+    def test_write_is_byte_identical_to_a_plain_csv_writer(self, tmp_path):
+        # The atomic path serialises through StringIO rather than the
+        # file object. csv defaults to \r\n line endings, so a StringIO
+        # built without newline="" would silently rewrite every line in
+        # the user's file the first time they saved.
+        import csv as _csv
+        rows = [
+            SessionRow("2026-05-28", "email", "e-1", 60),
+            SessionRow("2026-05-29", "coding", "c-1", 120),
+        ]
+        save_sessions(rows)
+
+        reference = tmp_path / "reference.csv"
+        with reference.open("w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=FIELDNAMES)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r._asdict())
+
+        assert get_csv_path().read_bytes() == reference.read_bytes()
+        assert load_sessions() == rows
+
+    def test_failed_write_leaves_original_intact(self, monkeypatch):
+        # The exact failure the old open("w") path could not survive: it
+        # truncated the file on open, so an interruption before the rows
+        # were flushed destroyed the history. os.replace() cannot leave
+        # a partial file — either the rename lands or it doesn't.
+        original = [SessionRow("2026-05-28", "email", "e-1", 60)]
+        save_sessions(original)
+        before = get_csv_path().read_bytes()
+
+        def boom(*args, **kwargs):
+            raise OSError("simulated failure mid-write")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            save_sessions([SessionRow("2026-05-29", "coding", "c-1", 999)])
+
+        assert get_csv_path().read_bytes() == before
+        assert load_sessions() == original
+
+    def test_no_tmp_left_behind_on_success(self):
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        assert not _tmp_path_for(get_csv_path()).exists()
+
+    def test_no_tmp_left_behind_on_failure(self, monkeypatch):
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+
+        def boom(*args, **kwargs):
+            raise OSError("simulated failure mid-write")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            save_sessions([SessionRow("2026-05-29", "coding", "c-1", 999)])
+        assert not _tmp_path_for(get_csv_path()).exists()
 
 
 # ---------------------------------------------------------------------------
