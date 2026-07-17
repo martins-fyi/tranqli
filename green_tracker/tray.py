@@ -149,7 +149,7 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # people to click it expecting something to happen.
     current = ctx.current_tag()
     current_action = tags_root.addAction(
-        f"Current tag: {current}" if current else "Current tag: none"
+        f"Current: {current}" if current else "Current: none"
     )
     current_action.setEnabled(False)
 
@@ -160,15 +160,15 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # which is the first-run case (§2a).
     tags_root.addAction("New Tag…", ctx.new_tag)
 
-    # Switch Tags ▸ — the N most-recent tags in MRU order, current one
-    # checked. Banks the current tag's time and starts the picked one
+    # Switch Between Tags ▸ — the N most-recent tags in MRU order, current
+    # one checked. Banks the current tag's time and starts the picked one
     # fresh at 00:00 PAUSED (§2c).
     #
     # MRU rather than an alphabetical list of every tag: the tags you
     # switch between are the ones you just used, and alphabetical order
     # buries them among every tag ever created. Storage keeps more than
     # this (RECENT_TAGS_MAX) so More… has history to draw on.
-    switch_menu = tags_root.addMenu("Switch Tags")
+    switch_menu = tags_root.addMenu("Switch Between Tags")
     recent = list(ctx.recent_tags())
     if recent:
         # Exclusive group so the checkmark reads as "this is the one
@@ -192,7 +192,7 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # Retag session ▸ — corrects which tag the *current* session belongs
     # to, carrying its accumulated time across, for when you started on
     # the wrong tag. Needs a session to retag, hence the `active` gate
-    # that Switch Tags doesn't have.
+    # that Switch Between Tags doesn't have.
     retag_menu = tags_root.addMenu("Retag session")
     if tags:
         for tag in sorted(tags.keys()):
@@ -208,8 +208,8 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # you didn't mean. Merge still prompts, but only for its target.
     #
     # Edit actions only — no "click tag = set as active" gesture. Picking
-    # a tag to work on is Switch Tags; correcting the current session's
-    # tag is Retag session.
+    # a tag to work on is Switch Between Tags; correcting the current
+    # session's tag is Retag session.
     edit_menu = tags_root.addMenu("Tag Edit")
     for tag in sorted(tags.keys()):
         label = f"{tag}    {tags[tag]}"
@@ -305,24 +305,23 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
 
     menu.addSeparator()
 
-    # --- Tray / Quit ------------------------------------------------------
-    menu.addAction("Minimize to tray", ctx.minimize_to_tray)
-    menu.addAction("Quit", ctx.quit_app)
-
     # --- Undo -------------------------------------------------------------
-    # Below Quit, which is where spec §3 puts it. Unusual, but deliberate:
-    # off the end of the list it can't be hit while reaching for anything
-    # else, and undo is rare enough that costing it a glance is cheaper
-    # than putting a data-mutating action next to items people click by
-    # muscle memory.
+    # Sits just above Minimize to tray, on its own separator so it is not
+    # flush against the neighbouring actions — undo is data-mutating, and
+    # the gap keeps it from being hit while reaching for something else.
     #
     # Greyed when the stack is empty. Restores whole-CSV snapshots via the
     # same storage.undo() the Archive and web-editor buttons will call in
     # phase 9 — the stack is global and in-process, so all three surfaces
     # pop the same one (§5).
-    menu.addSeparator()
     undo_action = menu.addAction("Undo", ctx.undo)
     undo_action.setEnabled(ctx.can_undo())
+
+    menu.addSeparator()
+
+    # --- Tray / Quit ------------------------------------------------------
+    menu.addAction("Minimize to tray", ctx.minimize_to_tray)
+    menu.addAction("Quit", ctx.quit_app)
 
 
 def show_context_menu(pos: QPoint, ctx: MenuContext,
