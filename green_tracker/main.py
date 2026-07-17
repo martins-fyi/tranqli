@@ -26,7 +26,7 @@ from __future__ import annotations
 import calendar
 import signal
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -43,15 +43,14 @@ try:
 except ImportError:
     QAnimationDriver = None  # type: ignore
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QPainter,
-    QPalette, QPen, QPixmap,
+    QBrush, QColor, QFontDatabase, QGuiApplication, QIcon, QPalette, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabWidget, QToolTip,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QListWidget, QMenu, QMessageBox, QPushButton, QSpinBox,
+    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
 from . import storage
@@ -458,169 +457,6 @@ class _ArchiveItemDelegate(QStyledItemDelegate):
             painter.setPen(option.palette.base().color())
             painter.drawLine(r.bottomLeft(), r.bottomRight())
         painter.restore()
-
-
-class _TagHeatmap(QWidget):
-    """GitHub-style calendar heatmap for one tag (spec §6b).
-
-    A rolling 12-month grid: columns are weeks, the 7 rows are Mon..Sun,
-    each cell shaded by the minutes tracked for this tag that day. A
-    single hue — the tag's accent colour — ramps light→dark across four
-    intensity levels, since the whole widget is one tag and the 16-colour
-    archive palette would say nothing here.
-
-    Intensity is relative to the tag's own busiest day in the window, not
-    an absolute minute count, so a light tag and a heavy tag each fill the
-    ramp instead of a low-volume tag showing as permanently pale.
-    """
-
-    _CELL = 11          # square side, px
-    _GAP = 3            # gap between squares, px
-    _TOP = 18           # month-label band above the grid
-    _LEFT = 30          # weekday-label gutter left of the grid
-    _ROWS = 7           # Mon..Sun
-    _LEVELS = 4         # non-zero intensity buckets
-
-    def __init__(
-        self,
-        accent: QColor,
-        minutes_by_date: Dict[str, int],
-        today: date,
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._accent = accent
-        self._minutes = minutes_by_date
-        self._today = today
-
-        # Rolling 12 months, then backed up to the start of that week so
-        # every column is a full Mon-anchored week.
-        window_start = today - timedelta(days=364)
-        self._start = window_start - timedelta(days=window_start.weekday())
-        self._cols = (today - self._start).days // 7 + 1
-
-        # Bucket boundaries come from the busiest in-window day, so the
-        # ramp is meaningful whatever the tag's overall volume.
-        self._peak = max(
-            (m for d, m in minutes_by_date.items() if d >= self._start.isoformat()),
-            default=0,
-        )
-
-        self.setMouseTracking(True)  # hover tooltips without a click
-        # Fixed both ways: the grid is exactly _cols weeks by 7 days, so a
-        # fixed size gives the enclosing scroll area a deterministic extent.
-        w = self._LEFT + self._cols * (self._CELL + self._GAP) + self._GAP
-        h = self._TOP + self._ROWS * (self._CELL + self._GAP) + self._GAP
-        self.setFixedSize(w, h)
-
-    # -- geometry / data, kept pure so it can be checked without painting --
-
-    def _level(self, minutes: int) -> int:
-        """0 for an untracked day, else 1..4 by share of the peak day."""
-        if minutes <= 0 or self._peak <= 0:
-            return 0
-        # ceil(4 * m / peak), clamped into 1..4.
-        return max(1, min(self._LEVELS, -(-self._LEVELS * minutes // self._peak)))
-
-    def _cell_date(self, col: int, row: int) -> date:
-        return self._start + timedelta(days=col * 7 + row)
-
-    def _cells(self):
-        """Yield (col, row, date, minutes, level) for every in-range day.
-
-        Days after today (the tail of the final week) are skipped, so the
-        grid stops at today like GitHub's does.
-        """
-        for col in range(self._cols):
-            for row in range(self._ROWS):
-                d = self._cell_date(col, row)
-                if d > self._today:
-                    continue
-                mins = self._minutes.get(d.isoformat(), 0)
-                yield col, row, d, mins, self._level(mins)
-
-    def _level_color(self, level: int) -> QColor:
-        """Empty cell for level 0, else accent blended light→full."""
-        base = self.palette().base().color()
-        if level <= 0:
-            # A hair off the background so empty days still read as a grid.
-            return _blend(base, self.palette().text().color(), 0.10)
-        # 1..4 -> 0.4, 0.6, 0.8, 1.0 of the way from a pale accent to full.
-        t = 0.4 + 0.2 * (level - 1)
-        pale = _blend(base, self._accent, 0.25)
-        return _blend(pale, self._accent, t)
-
-    def _cell_rect(self, col: int, row: int):
-        x = self._LEFT + col * (self._CELL + self._GAP)
-        y = self._TOP + row * (self._CELL + self._GAP)
-        return x, y, self._CELL, self._CELL
-
-    # -- painting ----------------------------------------------------------
-
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        p.setPen(Qt.NoPen)
-        for col, row, _d, _m, level in self._cells():
-            x, y, w, h = self._cell_rect(col, row)
-            p.fillRect(x, y, w, h, self._level_color(level))
-
-        # Weekday labels (Mon/Wed/Fri, like GitHub) and month labels along
-        # the top wherever a column's first day crosses into a new month.
-        label_font = QFont(self.font())
-        label_font.setPointSizeF(max(6.0, self.font().pointSizeF() - 2))
-        p.setFont(label_font)
-        p.setPen(QPen(self.palette().text().color()))
-
-        for row, name in ((0, "Mon"), (2, "Wed"), (4, "Fri")):
-            _x, y, _w, h = self._cell_rect(0, row)
-            p.drawText(0, y, self._LEFT - 4, h,
-                       int(Qt.AlignRight | Qt.AlignVCenter), name)
-
-        prev_month = None
-        for col in range(self._cols):
-            top_date = self._cell_date(col, 0)
-            if top_date.month != prev_month:
-                prev_month = top_date.month
-                x, _y, _w, _h = self._cell_rect(col, 0)
-                p.drawText(x, 0, 3 * (self._CELL + self._GAP), self._TOP - 2,
-                           int(Qt.AlignLeft | Qt.AlignVCenter),
-                           calendar.month_abbr[top_date.month])
-        p.end()
-
-    # -- hover tooltip -----------------------------------------------------
-
-    def mouseMoveEvent(self, event) -> None:
-        hit = self._cell_at(event.position().x(), event.position().y())
-        if hit is None:
-            QToolTip.hideText()
-            return
-        d, mins = hit
-        when = d.strftime("%a %d %b %Y")
-        dur = _format_dhm(mins) if mins else "nothing tracked"
-        QToolTip.showText(event.globalPosition().toPoint(), f"{when} — {dur}")
-
-    def _cell_at(self, px: float, py: float):
-        """(date, minutes) for the cell under a point, or None."""
-        if px < self._LEFT or py < self._TOP:
-            return None
-        col = int((px - self._LEFT) // (self._CELL + self._GAP))
-        row = int((py - self._TOP) // (self._CELL + self._GAP))
-        if not (0 <= col < self._cols and 0 <= row < self._ROWS):
-            return None
-        d = self._cell_date(col, row)
-        if d > self._today or d < self._start:
-            return None
-        return d, self._minutes.get(d.isoformat(), 0)
-
-
-def _blend(a: QColor, b: QColor, t: float) -> QColor:
-    """Linear blend a→b by t in [0, 1], per channel."""
-    t = max(0.0, min(1.0, t))
-    return QColor(
-        round(a.red() + (b.red() - a.red()) * t),
-        round(a.green() + (b.green() - a.green()) * t),
-        round(a.blue() + (b.blue() - a.blue()) * t),
-    )
 
 
 def _set_windows_app_user_model_id() -> None:
@@ -2119,9 +1955,7 @@ class App:
         """
         dialog = QDialog(self.widget)
         dialog.setWindowTitle("Archive")
-        # Wider than the old 640 so a per-tag tab's full-year heatmap fits
-        # without scrolling in the common case; it scrolls if narrowed.
-        dialog.resize(820, 560)
+        dialog.resize(640, 520)
         layout = QVBoxLayout(dialog)
 
         # One tab per tag plus an "All" tab (§6a). The tab set is rebuilt
@@ -2319,14 +2153,10 @@ class App:
             accent = self._archive_tag_accent(tag)
             tree = self._make_archive_tree()
             self._populate_archive_tree(tree, tag_filter=tag)
-            # Heatmap above the list, both in one tab. The tab's top-level
-            # widget is the container, but the context menu is wired to the
-            # tree itself, so mutation handlers still receive the tree.
-            page = self._make_tag_tab(tag, accent, tree)
-            # Lifetime total in the tab label, so the per-tag view needs
-            # no Total rows of its own (§6b).
+            # Lifetime total in the tab label; per-month subtotals live in
+            # the Year→Month tree (§6b, restored).
             label = f"{tag}   {storage.format_tag_total(totals.get(tag, 0))}"
-            index = tabs.addTab(page, label)
+            index = tabs.addTab(tree, label)
             tabs.tabBar().setTabTextColor(index, accent)
             if tag == prev_tag:
                 select_index = index
@@ -2334,41 +2164,6 @@ class App:
         self._apply_archive_filter()
         tabs.blockSignals(False)
         tabs.setCurrentIndex(select_index)
-
-    def _make_tag_tab(
-        self, tag: str, accent: QColor, tree: QTreeWidget,
-    ) -> QWidget:
-        """A per-tag tab page: calendar heatmap over the session list."""
-        minutes_by_date: Dict[str, int] = {}
-        for s in storage.load_sessions():
-            if s.tag == tag:
-                minutes_by_date[s.date] = (
-                    minutes_by_date.get(s.date, 0) + s.minutes
-                )
-
-        page = QWidget()
-        col = QVBoxLayout(page)
-        col.setContentsMargins(0, 0, 0, 0)
-
-        heatmap = _TagHeatmap(accent, minutes_by_date, date.today())
-        # A full year of cells is wider than a comfortable dialog, so the
-        # heatmap scrolls horizontally when the window is narrower than it,
-        # rather than forcing the dialog wide or clipping. Fixed to the
-        # heatmap's height and never scrolling vertically — it is a strip,
-        # not a pane.
-        scroll = QScrollArea()
-        scroll.setWidget(heatmap)
-        scroll.setWidgetResizable(False)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        # Height = heatmap + room for the scrollbar when it appears, so its
-        # arrival doesn't eat into the grid.
-        scroll.setFixedHeight(heatmap.height() + 16)
-
-        col.addWidget(scroll)
-        col.addWidget(tree, 1)   # the list takes the remaining height
-        return page
 
     def _apply_archive_filter(self) -> None:
         """Hide per-tag tabs whose name doesn't contain the search text.
@@ -2466,9 +2261,15 @@ class App:
                 auto_idx += 1
 
         # A per-tag tab is a single tag throughout, so the colour chips
-        # and Total rows that distinguish tags in the All view would only
-        # repeat information (§6b). Suppressed together via this flag.
+        # that distinguish tags in the All view say nothing here.
         chips = tag_filter is None
+
+        # Per-month Total rows, though, are NOT redundant with the tab's
+        # single lifetime figure — they show the per-month breakdown that
+        # figure hides — so the Year→Month grouping keeps them in per-tag
+        # tabs too. The Recent overlay does not: a subtotal of the latest
+        # five, sitting right under the header, is the noise §6b meant to
+        # cut, and only the month totals were asked back.
 
         # --- Recent (always expanded, no nesting) ---
         if recent:
@@ -2512,7 +2313,7 @@ class App:
                 year_item.addChild(month_item)
                 self._add_tag_groups(
                     month_item, months[month], tag_colors, active_key,
-                    show_chips=chips, show_totals=chips,
+                    show_chips=chips, show_totals=True,
                 )
             # Years collapsed by default — keeps the recent list dominant.
 
