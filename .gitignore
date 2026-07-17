@@ -51,6 +51,7 @@ active_session.json
 
 # --- Working session notes (kept local) ---
 session-handoff.md
+tag-management-build-spec.md
 
 # --- Claude Code local state ---
 .claude/

@@ -231,31 +231,28 @@ def set_minutes_for_tag_date(
 # ------------------------------------------------------------------
 
 def format_tag_total(minutes: int) -> str:
-    """Format a minute count as 'Xd Xh Xm' with cascading omission of
-    leading zero fields. Mirrors main.py's _format_dhm and the web
-    editor's formatDhm so durations read identically across the menu,
-    archive, and web surfaces.
+    """Format a minute count as 'Dd Hh' (brief §4 tag-total format).
+
+    Days and hours are both zero-padded to 2; the days field grows past
+    two digits naturally for multi-month aggregates. Sub-hour remainders
+    are truncated, not rounded — a tag total is a coarse lifetime
+    readout, not an exact duration.
 
     Examples:
-        0     -> "00m"
-        45    -> "45m"
-        90    -> "01h 30m"
-        1500  -> "01d 01h 00m"
+        0      -> "00d 00h"
+        90     -> "00d 01h"
+        3000   -> "02d 02h"
+        144000 -> "100d 00h"
 
-    Days field grows beyond 2 digits naturally for multi-month
-    aggregates. Once a larger field appears, smaller fields are
-    always shown (even at zero) so the unit anchor is unambiguous
-    — "01d 30m" would be visually ambiguous, "01d 00h 30m" isn't.
+    Deliberately NOT the cascading 'Xd Xh Xm' used by main.py's
+    _format_dhm and the web editor's formatDhm. Those render individual
+    session durations, where minutes matter; this renders per-tag
+    lifetimes, which the brief specifies as days + hours only.
     """
     m = max(0, int(minutes))
     days = m // 1440
     hours = (m % 1440) // 60
-    mins = m % 60
-    if days > 0:
-        return f"{days:02d}d {hours:02d}h {mins:02d}m"
-    if hours > 0:
-        return f"{hours:02d}h {mins:02d}m"
-    return f"{mins:02d}m"
+    return f"{days:02d}d {hours:02d}h"
 
 
 def tag_totals(sessions: list[SessionRow] | None = None) -> dict[str, str]:
@@ -404,7 +401,12 @@ def rename_tag(old_tag: str, new_tag: str) -> bool:
 
 # Bumped whenever the config schema needs migration. Pre-rename configs
 # have no version field at all (treated as v1).
-CURRENT_CONFIG_VERSION = 2
+CURRENT_CONFIG_VERSION = 3
+
+# Cap for the recent_tags MRU list. The Tags menu only ever displays 5,
+# but we keep more than we show so the "More..." surface has history to
+# draw on without a second store.
+RECENT_TAGS_MAX = 20
 
 # Migration map for the widget_size rename. The four-tier scheme
 # (mini / small / medium / large = 13 / 22 / 48 / 64 px) was collapsed
@@ -420,8 +422,64 @@ _WIDGET_SIZE_MIGRATION_V1_TO_V2 = {
 }
 
 
+def _seed_recent_tags() -> list[str]:
+    """Build an initial recent_tags MRU from existing session history.
+
+    Distinct tags ordered by their most recent date, newest first,
+    capped at RECENT_TAGS_MAX. Without this an upgrading user starts
+    with an empty MRU and the fresh-launch picker treats them as a
+    first-ever user, even with years of history behind them.
+
+    Best-effort by contract: this runs inside load_config(), which runs
+    at startup before anything is on screen, so a damaged or unreadable
+    sessions.csv must not stop the app from launching. A failed seed
+    costs an empty Tags menu that refills as soon as tags get used; a
+    raised exception would cost the whole app. Returns [] on any read
+    problem and lets the version bump proceed regardless.
+
+    Dates are day-granular, so tags last used on the same day have no
+    true ordering between them. Python's stable sort keeps them in CSV
+    order — arbitrary but deterministic, which is all the MRU needs.
+    """
+    try:
+        sessions = load_sessions()
+    except (OSError, csv.Error, KeyError, ValueError, TypeError):
+        return []
+    latest: dict[str, str] = {}
+    for row in sessions:
+        if not row.tag:
+            continue
+        if row.tag not in latest or row.date > latest[row.tag]:
+            latest[row.tag] = row.date
+    ordered = sorted(latest, key=lambda t: latest[t], reverse=True)
+    return ordered[:RECENT_TAGS_MAX]
+
+
+def _new_config() -> dict:
+    """Config for a first-ever launch, stamped at the current version.
+
+    The stamp is the point. An unstamped config is indistinguishable
+    from a genuine v1 one on the next load, so _migrate_config would
+    read version 1 and apply the v1->v2 size remap to a widget_size the
+    user had just picked — silently bumping their choice up a tier.
+
+    Seeds the MRU the same way the v2->v3 migration does: no config but
+    an existing sessions.csv is a user with history (config deleted, or
+    restored from a partial backup), not a new one.
+    """
+    return {
+        "config_version": CURRENT_CONFIG_VERSION,
+        "recent_tags": _seed_recent_tags(),
+        "tag_schemes": {},
+    }
+
+
 def _migrate_config(config: dict) -> tuple[dict, bool]:
-    """Apply any one-time field migrations. Returns (config, changed)."""
+    """Apply any one-time field migrations. Returns (config, changed).
+
+    Steps cascade: `version` is read once, so a v1 config falls through
+    every block below and lands on the current version.
+    """
     changed = False
     version = config.get("config_version", 1)
 
@@ -432,13 +490,25 @@ def _migrate_config(config: dict) -> tuple[dict, bool]:
         config["config_version"] = 2
         changed = True
 
+    if version < 3:
+        # Tag MRU list and per-tag colour scheme, both introduced by the
+        # tag-management work. Guarded on absence rather than written
+        # unconditionally so a config already carrying these keys keeps
+        # its data — and so the seed's CSV read is skipped entirely when
+        # there's nothing to seed.
+        if "recent_tags" not in config:
+            config["recent_tags"] = _seed_recent_tags()
+        config.setdefault("tag_schemes", {})
+        config["config_version"] = 3
+        changed = True
+
     return config, changed
 
 
 def load_config() -> dict:
     path = get_config_path()
     if not path.exists():
-        return {}
+        return _new_config()
     with path.open(encoding="utf-8") as f:
         config = json.load(f)
     config, migrated = _migrate_config(config)
