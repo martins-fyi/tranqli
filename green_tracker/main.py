@@ -364,20 +364,6 @@ _ARCHIVE_TAG_PALETTE_NAMES: List[str] = [
 # system. Drawn by _ArchiveItemDelegate.
 _ARCHIVE_SECTION_STROKE = QColor("#3A3A3A")
 
-# In-progress session marker (archive view): the row representing
-# the currently-active (tag, today) session gets a rust background
-# and a warmer-cream text so it stands out from any tag that
-# happens to land on a similar palette hue. Same rust hex as the
-# widget's idle-auto-pause background — visual continuity across
-# the app: rust always means "this is the session currently in
-# flight". Applies whether the session is RUNNING or PAUSED, as
-# long as _session_started is True.
-_ARCHIVE_IN_PROGRESS_BG   = QColor("#8B5A2B")  # rust
-_ARCHIVE_IN_PROGRESS_TEXT = QColor("#F5EFE0")  # warm cream — brighter than
-                                               # the standard text fill so
-                                               # the row reads distinctly
-                                               # against the rust bg.
-
 # Cream text color preserved on selected rows — same as the widget
 # face cream. Prevents Qt's default HighlightedText (black/white,
 # theme-dependent) from washing out tag-colored rows on selection.
@@ -2243,16 +2229,6 @@ class App:
         )
         recent = ordered[:5]
 
-        # Active session identity — the (tag, today_str) row that
-        # represents the session currently in flight. Used to mark
-        # that single row with rust background and warm-cream text.
-        # None when there's no active session (fresh launch, no tag
-        # picked yet, or after Save/Discard), in which case no row
-        # gets marked.
-        active_key: Optional[tuple] = None
-        if self._session_started and self.tracker.tag is not None:
-            active_key = (self.tracker.tag, self._today_str())
-
         # Tag → colour cache for this view, filled entirely from the one
         # resolver so every section paints from the same source. It used
         # to be computed inline here with its own palette-index counter,
@@ -2281,7 +2257,7 @@ class App:
             self._make_header_bold(recent_root)
             tree.addTopLevelItem(recent_root)
             self._add_tag_groups(
-                recent_root, recent, tag_colors, active_key,
+                recent_root, recent, tag_colors,
                 show_chips=True, show_totals=recent_totals,
             )
             recent_root.setExpanded(True)
@@ -2316,7 +2292,7 @@ class App:
                 month_item = QTreeWidgetItem([calendar.month_name[int(month)]])
                 year_item.addChild(month_item)
                 self._add_tag_groups(
-                    month_item, months[month], tag_colors, active_key,
+                    month_item, months[month], tag_colors,
                     show_chips=True, show_totals=True,
                 )
             # Years collapsed by default — keeps the recent list dominant.
@@ -2373,7 +2349,6 @@ class App:
         parent_item: QTreeWidgetItem,
         sessions: List[storage.SessionRow],
         tag_colors: Dict[str, QColor],
-        active_key: Optional[tuple] = None,
         show_chips: bool = True,
         show_totals: bool = True,
     ) -> None:
@@ -2381,7 +2356,9 @@ class App:
 
         Each tag's sessions share a background color from `tag_colors`,
         the stable global mapping built once in `_populate_archive_tree`.
-        The same tag has the same color in every section.
+        The same tag has the same color in every section — the live
+        session is not singled out; the Archive reviews sessions, and the
+        widget already shows running vs paused.
 
         Tags with 2+ sessions in this section get a Total summary row
         at the end of their group, on the SAME color as the tag —
@@ -2391,20 +2368,8 @@ class App:
         Sessions within a tag are kept in the order they arrived
         (already date-sorted by the caller).
 
-        `active_key` is `(tag, today_str)` when there's a session in
-        flight, else None. The row matching the key gets rust
-        background and warm-cream text instead of its tag color —
-        the "this is the session currently in flight" marker. Only
-        the session row matches; the Total summary row never does
-        (it's not a real session).
-
         `show_chips` False leaves session rows on the tree's default
-        background — the per-tag view, where one shared colour would say
-        nothing. `show_totals` False omits the Total summary rows, since
-        a per-tag tab carries its lifetime total in the tab label. The
-        in-progress marker still applies with chips off: it means "this
-        is live", not "this is tag X", so it stays useful in a one-tag
-        view.
+        background. `show_totals` False omits the Total summary rows.
         """
         # Group by tag, preserving first-appearance order.
         by_tag: Dict[str, List[storage.SessionRow]] = {}
@@ -2415,29 +2380,16 @@ class App:
                 tag_order.append(s.tag)
             by_tag[s.tag].append(s)
 
-        in_progress_brush = QBrush(_ARCHIVE_IN_PROGRESS_BG)
-        in_progress_fg = QBrush(_ARCHIVE_IN_PROGRESS_TEXT)
-
         for tag in tag_order:
             tag_sessions = by_tag[tag]
             brush = QBrush(tag_colors[tag])
-            # Session rows, tinted with this tag's color — unless
-            # the row matches active_key, in which case rust+warm-
-            # cream marks it as the in-progress session.
+            # Session rows, tinted with this tag's color. The live session
+            # gets no special marker: the widget already shows running vs
+            # paused, and the Archive is for reviewing sessions, so one
+            # tag paints one colour everywhere with no exceptions.
             for s in tag_sessions:
                 item = self._make_session_item(s)
-                is_active = (
-                    active_key is not None
-                    and s.tag == active_key[0]
-                    and s.date == active_key[1]
-                )
-                # Chips off: leave the default background unless the row
-                # is the live one, which still earns its rust marker.
-                if is_active:
-                    for col in range(4):
-                        item.setBackground(col, in_progress_brush)
-                        item.setForeground(col, in_progress_fg)
-                elif show_chips:
+                if show_chips:
                     for col in range(4):
                         item.setBackground(col, brush)
                 parent_item.addChild(item)
@@ -2455,8 +2407,7 @@ class App:
                 )
                 # SAME color as the tag — the bold-italic label / value
                 # carries the "this is a summary" signal, no separate
-                # background needed. Total never gets the in-progress
-                # marker; it's a summary, not a session.
+                # background needed.
                 for col in range(4):
                     total_item.setBackground(col, brush)
                 f = total_item.font(1)
