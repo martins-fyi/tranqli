@@ -221,7 +221,7 @@ Browseable list of saved sessions:
 ## 10. Storage
 
 - Plain **CSV**, human-readable, Excel-friendly.
-- Location: `%APPDATA%\GreenTracker\sessions.csv` (create dir on first run).
+- Location: `%APPDATA%\Tranqli\sessions.csv` (create dir on first run).
 - Columns:
 
   | date (YYYY-MM-DD) | tag | session_name | minutes |
