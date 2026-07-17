@@ -84,7 +84,7 @@ _HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Green Tracker — Sessions</title>
+<title>Tranqli — Sessions</title>
 <style>
   :root {
     --bg: #f7f7f4;
@@ -133,6 +133,16 @@ _HTML = r"""<!DOCTYPE html>
     letter-spacing: 0.05em;
   }
   tbody tr:last-child td { border-bottom: none; }
+  /* Footer — the app's de-facto About: name + source link. */
+  .page-footer {
+    max-width: 900px;
+    margin: 1.5rem auto 2rem auto;
+    padding: 0 1.5rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: center;
+  }
+  .page-footer a { color: var(--accent); }
   input {
     width: 100%;
     padding: 0.3rem 0.4rem;
@@ -279,7 +289,7 @@ _HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>Sessions</h1>
+  <h1>Tranqli Sessions</h1>
   <div class="section-label">Tag totals</div>
   <div id="tag-totals" class="tag-totals"></div>
   <div class="section-label">Filter</div>
@@ -306,6 +316,11 @@ _HTML = r"""<!DOCTYPE html>
     <span id="status"></span>
   </div>
 </div>
+<footer class="page-footer">
+  Tranqli &middot;
+  <a href="https://github.com/martins-fyi/tranqli" target="_blank"
+     rel="noopener">github.com/martins-fyi/tranqli</a>
+</footer>
 <script>
 const KEYS = ['date', 'tag', 'session_name', 'minutes'];
 
