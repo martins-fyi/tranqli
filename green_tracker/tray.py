@@ -13,30 +13,27 @@ getter callables and fires actions via callable fields on the supplied
 `MenuContext`. That keeps `tray.py` ignorant of tracker / storage / widget
 internals — `main.py` does all the wiring.
 
-Wiring (done in main.py):
+Wiring (done in TrackerApp.__init__ in main.py):
 
-    ctx = MenuContext(
-        current_size=lambda: widget.size_name,
-        current_shape=lambda: widget.shape,
-        tag_lifetimes=storage.tag_lifetimes,
-        has_active_session=tracker.is_running,
-        save_session=on_save_session,
-        set_tag=tracker.set_tag,
-        prompt_new_tag=on_prompt_new_tag,
-        rename_session=on_rename_session,
-        delete_session=on_delete_session,
-        set_size=widget.set_size,
-        set_shape=widget.set_shape,
-        open_archive=on_open_archive,
-        open_csv_editor=webserver.open_in_browser,
-        minimize_to_tray=widget.hide,
-        quit_app=app.quit,
-    )
-
+    self.menu_ctx = MenuContext(...)   # every field below, no defaults
     widget.right_clicked.connect(lambda pos: show_context_menu(pos, ctx))
-
     tray = TrayIcon(ctx)
-    tray.left_clicked.connect(widget.ensure_on_screen)
+
+The fields are filled with main.py's own bound methods, not storage or
+tracker functions passed straight through — the handlers wrap those and
+then repair app state (re-seeding the widget's carry, re-pointing the
+live tracker, persisting config). The authoritative list is the dataclass
+below; it is deliberately not restated here, since a copy of the
+constructor is a copy that goes stale.
+
+Two fields look interchangeable and are not:
+
+    set_tag     "Retag session" — rebinds the current session's tag and
+                carries its accumulated time across, re-attributing
+                in-progress work. For starting on the wrong tag.
+    switch_tag  "Switch task" — banks the current tag's time via the
+                save path first, then starts the picked tag at 00:00,
+                PAUSED (spec §2c). For moving on to the next thing.
     tray.setToolTip("Tranqli")
     tray.show()
     tracker.running_changed.connect(tray.set_running)
@@ -85,7 +82,8 @@ class MenuContext:
     # ---- Action callbacks ------------------------------------------------
     save_session:     Callable[[], None]
     new_session:      Callable[[], None]             # main.py prompts to save first
-    set_tag:          Callable[[str], None]          # existing tag chosen
+    set_tag:          Callable[[str], None]          # "Retag session" — rebind, keep time
+    switch_tag:       Callable[[str], None]          # "Switch task" — bank time, then rebind
     prompt_new_tag:   Callable[[], None]             # main.py opens input dialog
     rename_tag:       Callable[[str], None]          # main.py prompts for new name
     add_record:       Callable[[str], None]          # main.py opens AddRecordDialog
@@ -131,21 +129,37 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # the tracker so the next widget click re-opens the tag picker.
     menu.addAction("New session", ctx.new_session)
 
-    # --- Set tag (submenu: existing tags only — new tags via web UI) ------
-    set_tag_menu = menu.addMenu("Set tag")
+    # --- Switch task (submenu: existing tags only — new tags via web UI) --
+    # Banks the current tag's time, then starts the picked tag fresh at
+    # 00:00, PAUSED (spec §2c). Always available: switching with nothing
+    # running is just picking what to work on next.
+    switch_task_menu = menu.addMenu("Switch task")
     if tags:
         for tag in sorted(tags.keys()):
             # `t=tag` defaults the lambda's free var so each closure binds
             # its own tag — without this, every lambda would capture the
             # final loop value (Python closure-in-loop gotcha).
-            set_tag_menu.addAction(tag, lambda t=tag: ctx.set_tag(t))
-    set_tag_menu.setEnabled(active and bool(tags))
+            switch_task_menu.addAction(tag, lambda t=tag: ctx.switch_tag(t))
+    switch_task_menu.setEnabled(bool(tags))
+
+    # --- Retag session (submenu: existing tags only) ----------------------
+    # Corrects which tag the *current* session belongs to, carrying its
+    # accumulated time across — for when you started on the wrong tag.
+    # Needs a session to retag, hence the `active` gate that Switch task
+    # doesn't have.
+    retag_menu = menu.addMenu("Retag session")
+    if tags:
+        for tag in sorted(tags.keys()):
+            retag_menu.addAction(tag, lambda t=tag: ctx.set_tag(t))
+    retag_menu.setEnabled(active and bool(tags))
 
     # --- Tags submenu — per-tag actions nested under each tag's label.
     # Label shows lifetime total ("work    01h 30m"). Opening a tag's
     # entry reveals three actions: Rename tag, Add record, Open Archive.
-    # The old "click tag = set as active" gesture is gone — that
-    # functionality lives in the dedicated "Set tag" submenu just above.
+    # The old "click tag = set as active" gesture is gone — picking a tag
+    # to work on is "Switch task" above; correcting the current session's
+    # tag is "Retag session". This submenu is edit actions only, and is
+    # what spec §3 turns into "Tags edit ▸" in phase 4.
     if tags:
         tags_menu = menu.addMenu("Tags")
         for tag in sorted(tags.keys()):

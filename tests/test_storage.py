@@ -21,6 +21,8 @@ from green_tracker.storage import (
     load_config,
     load_sessions,
     merge_into,
+    push_recent_tag,
+    rename_recent_tag,
     rename_session,
     rename_tag,
     retag_session,
@@ -593,6 +595,113 @@ class TestConfigMigration:
         assert config["color_scheme"] == "Twilight"
         assert config["tag_color_overrides"] == {"work": "#aabbcc"}
         assert config["last_tag"] == "work"
+
+
+# ---------------------------------------------------------------------------
+# Recent-tags MRU (spec §2c step 3)
+# ---------------------------------------------------------------------------
+
+class TestPushRecentTag:
+    def test_pushes_onto_empty_mru(self):
+        config = {}
+        push_recent_tag(config, "work")
+        assert config["recent_tags"] == ["work"]
+
+    def test_most_recent_first(self):
+        config = {}
+        for tag in ("work", "admin", "reading"):
+            push_recent_tag(config, tag)
+        assert config["recent_tags"] == ["reading", "admin", "work"]
+
+    def test_repicked_tag_moves_rather_than_repeats(self):
+        config = {"recent_tags": ["admin", "work", "reading"]}
+        push_recent_tag(config, "reading")
+        assert config["recent_tags"] == ["reading", "admin", "work"]
+
+    def test_capped_at_max(self):
+        config = {}
+        for i in range(RECENT_TAGS_MAX + 5):
+            push_recent_tag(config, f"tag{i}")
+        recent = config["recent_tags"]
+        assert len(recent) == RECENT_TAGS_MAX
+        assert recent[0] == f"tag{RECENT_TAGS_MAX + 4}"   # newest kept
+        assert "tag0" not in recent                       # oldest evicted
+
+    def test_mirrors_last_tag(self):
+        config = {}
+        push_recent_tag(config, "work")
+        push_recent_tag(config, "admin")
+        assert config["last_tag"] == "admin"
+        assert config["last_tag"] == config["recent_tags"][0]
+
+    def test_blank_tags_ignored(self):
+        config = {"recent_tags": ["work"], "last_tag": "work"}
+        for blank in ("", "   ", None):
+            push_recent_tag(config, blank)
+        assert config["recent_tags"] == ["work"]
+        assert config["last_tag"] == "work"
+
+    def test_tag_is_stripped(self):
+        config = {}
+        push_recent_tag(config, "  work  ")
+        assert config["recent_tags"] == ["work"]
+
+    def test_leaves_other_config_keys_alone(self):
+        config = {"widget_size": "small", "tag_schemes": {"work": "Earthen"}}
+        push_recent_tag(config, "work")
+        assert config["widget_size"] == "small"
+        assert config["tag_schemes"] == {"work": "Earthen"}
+
+
+class TestRenameRecentTag:
+    def test_rename_preserves_position(self):
+        # A rename is not a use — it must not jump to the front.
+        config = {"recent_tags": ["admin", "work", "reading"]}
+        rename_recent_tag(config, "work", "employment")
+        assert config["recent_tags"] == ["admin", "employment", "reading"]
+
+    def test_rename_updates_mirrored_last_tag(self):
+        config = {"recent_tags": ["work", "admin"], "last_tag": "work"}
+        rename_recent_tag(config, "work", "employment")
+        assert config["last_tag"] == "employment"
+        assert config["last_tag"] == config["recent_tags"][0]
+
+    def test_rename_of_inactive_tag_leaves_last_tag_alone(self):
+        config = {"recent_tags": ["admin", "work"], "last_tag": "admin"}
+        rename_recent_tag(config, "work", "employment")
+        assert config["last_tag"] == "admin"
+        assert config["recent_tags"] == ["admin", "employment"]
+
+    def test_rename_onto_existing_name_merges_keeping_recent_position(self):
+        # Mirrors storage.rename_tag folding colliding rows together.
+        config = {"recent_tags": ["admin", "work", "reading"]}
+        rename_recent_tag(config, "reading", "admin")
+        assert config["recent_tags"] == ["admin", "work"]
+
+    def test_rename_of_absent_tag_is_a_noop(self):
+        config = {"recent_tags": ["admin", "work"], "last_tag": "admin"}
+        rename_recent_tag(config, "nosuch", "other")
+        assert config["recent_tags"] == ["admin", "work"]
+        assert config["last_tag"] == "admin"
+
+    def test_degenerate_input_is_a_noop(self):
+        for old, new in (("", "x"), ("x", ""), ("same", "same"), (None, "x")):
+            config = {"recent_tags": ["admin"], "last_tag": "admin"}
+            rename_recent_tag(config, old, new)
+            assert config["recent_tags"] == ["admin"]
+            assert config["last_tag"] == "admin"
+
+    def test_mru_never_outlives_a_renamed_tag(self):
+        # The invariant the helper exists to protect: after renaming a
+        # tag in storage, the MRU must not still offer the old name.
+        save_sessions([SessionRow("2026-05-28", "work", "w-1", 60)])
+        config = {"recent_tags": ["work"], "last_tag": "work"}
+        assert rename_tag("work", "employment") is True
+        rename_recent_tag(config, "work", "employment")
+        stored = {r.tag for r in load_sessions()}
+        assert "work" not in stored
+        assert "work" not in config["recent_tags"]
+        assert config["recent_tags"] == ["employment"]
 
 
 # ---------------------------------------------------------------------------

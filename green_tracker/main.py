@@ -666,6 +666,7 @@ class App:
             save_session=self.on_save_session,
             new_session=self.on_new_session,
             set_tag=self.on_set_tag,
+            switch_tag=self.on_switch_tag,
             prompt_new_tag=self.on_prompt_new_tag,
             rename_tag=self.on_rename_tag,
             add_record=self.on_add_record,
@@ -1007,9 +1008,10 @@ class App:
                 date_str=data["date_str"],
                 minutes=data["minutes"],
             )
-            # Pin last_tag so the next session starts with the same tag
-            # (no UI surprise — the user "continues" by picking it).
-            self.config["last_tag"] = data["tag"]
+            # Pin the recovered tag as most-recent so the next session
+            # starts with it (no UI surprise — the user "continues" by
+            # picking it). push_recent_tag mirrors last_tag for us.
+            storage.push_recent_tag(self.config, data["tag"])
             storage.save_config(self.config)
             # If the active tag matches the recovered tag (e.g.
             # auto-resume already set us up for the same tag today),
@@ -1211,7 +1213,7 @@ class App:
                     session_name=name,
                 )
 
-        self.config["last_tag"] = self.tracker.tag
+        storage.push_recent_tag(self.config, self.tracker.tag)
         storage.save_config(self.config)
 
         self.tracker.reset()
@@ -1352,20 +1354,25 @@ class App:
             self._update_running_state()
 
     def on_set_tag(self, tag: str) -> None:
-        """Set tag on the live tracker AND persist as last_tag.
+        """Rebind the live tracker's tag, keeping accumulated time.
+
+        Surfaced as "Retag session" — it corrects which tag the current
+        session belongs to. The tracker's accumulated time is left alone,
+        so on save it lands on whatever tag is set now: the in-progress
+        work is *re-attributed* to the new tag. That is the point of the
+        entry — you started tracking, then noticed it was the wrong tag.
+
+        Contrast on_switch_tag ("Switch task"), which banks the current
+        tag's time first and starts the new one at zero. Both change the
+        active tag; only this one moves the time already on the clock.
 
         Also seeds `_carry_seconds` from whatever's saved for
         (tag, today) so the widget's displayed total reads as the
         day's cumulative for this tag — not just this session's
-        tracked time. When the user assigns a different tag mid-
-        session, the carry is re-seeded from the new tag's storage
-        row, which means the displayed total swaps to the new tag's
-        running cumulative. The tracker's accumulated time is left
-        alone — on save, it gets added to whatever tag is currently
-        set (re-attribution of in-progress work to the new tag).
+        tracked time.
         """
         self.tracker.set_tag(tag)
-        self.config["last_tag"] = tag
+        storage.push_recent_tag(self.config, tag)
         storage.save_config(self.config)
         self._carry_seconds = (
             storage.today_minutes_for_tag(tag, self._today_str()) * 60
@@ -1373,6 +1380,40 @@ class App:
         # New tag means the snapshot's tag field is stale — refresh.
         if self._has_active_session():
             self._write_snapshot()
+
+    def on_switch_tag(self, tag: str) -> None:
+        """Switch task (spec §2c): bank the current tag, start the new one.
+
+        Surfaced as "Switch task". Unlike on_set_tag / "Retag session",
+        the time already on the clock stays with the tag that earned it.
+
+        1. Commit whatever is unsaved via on_save_session — the same code
+           path as the menu's own Save, so rounding, midnight splitting
+           and (tag, date) merging behave identically.
+        2. Rebind to `tag`. on_save_session has already reset the tracker,
+           so the new session starts at zero with no start_timestamp —
+           PAUSED, per the confirmed behaviour. Switching never resumes:
+           a mis-click in the menu must not silently start recording time
+           against the wrong tag.
+        3. on_set_tag pushes the MRU and re-seeds the carry, so the widget
+           immediately reads the new tag's total for today.
+
+        The tag guard keeps on_save_session's no-tag branch unreachable
+        from here: it would open a picker mid-switch, and cancelling that
+        picker returns with the tracker untouched, leaving this method to
+        rebind over time it had failed to bank. Untagged time cannot be
+        committed anywhere anyway — there is no tag to file it under.
+
+        _session_started stays True so the next left-click starts the new
+        tag straight away rather than re-opening the picker (§2b) — the
+        user has just chosen a tag; asking again would be noise.
+        """
+        if self.tracker.tag is not None and self._has_active_session():
+            self.on_save_session()
+
+        self.on_set_tag(tag)
+        self._session_started = True
+        self._update_running_state()
 
     def on_prompt_new_tag(self) -> None:
         """Prompt to set the tag — delegates to the start-of-session picker.
@@ -1429,11 +1470,15 @@ class App:
         if not storage.rename_tag(old_tag, new_tag):
             return
 
+        # The MRU follows the rename whether or not the renamed tag is
+        # the live one — otherwise the picker keeps offering a name that
+        # no longer exists in storage.
+        storage.rename_recent_tag(self.config, old_tag, new_tag)
+        storage.save_config(self.config)
+
         # Re-point the live tracker if it was using the old tag.
         if self.tracker.tag == old_tag:
             self.tracker.set_tag(new_tag)
-            self.config["last_tag"] = new_tag
-            storage.save_config(self.config)
         # Carry may need re-seeding — either the active tag was just
         # renamed, or it absorbed merged minutes from another row.
         self._refresh_carry_from_storage()
@@ -2199,12 +2244,14 @@ class App:
         carry — same reasoning as _write_rows_for_web above."""
         affected = storage.rename_tag(old_tag, new_tag)
         if affected:
+            # The MRU follows the rename regardless of what's live, so
+            # the picker can't keep offering the old name.
+            storage.rename_recent_tag(self.config, old_tag, new_tag)
+            storage.save_config(self.config)
             # The active tracker tag itself may have been renamed; if
             # so, re-point it before re-seeding the carry.
             if self.tracker.tag == old_tag:
                 self.tracker.set_tag(new_tag)
-                self.config["last_tag"] = new_tag
-                storage.save_config(self.config)
             self._refresh_carry_from_storage()
         return affected
 

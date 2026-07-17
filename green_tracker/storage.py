@@ -706,6 +706,69 @@ def save_config(config: dict) -> None:
 
 
 # ------------------------------------------------------------------
+# Recent-tags MRU (spec §2c step 3)
+# ------------------------------------------------------------------
+#
+# last_tag predates recent_tags and holds the same fact as
+# recent_tags[0]. Rather than repoint its two readers — auto-resume at
+# launch and the tag picker's default — it is kept as a mirror,
+# maintained by the two helpers below. That makes them the only places
+# either key is written, so the pair cannot drift; a direct assignment
+# to config["last_tag"] anywhere else reintroduces exactly that risk.
+#
+# Both mutate `config` in place and leave persistence to the caller,
+# matching how main.py holds a config dict and calls save_config itself.
+
+
+def push_recent_tag(config: dict, tag: str) -> None:
+    """Move `tag` to the front of the MRU, most-recent first.
+
+    Deduplicates, so a re-picked tag moves rather than repeats, and caps
+    at RECENT_TAGS_MAX. Blank tags are ignored rather than stored — the
+    menu has no use for an empty entry, and the tracker treats "no tag"
+    as None, not "".
+    """
+    tag = (tag or "").strip()
+    if not tag:
+        return
+    recent = [t for t in config.get("recent_tags", []) if t != tag]
+    recent.insert(0, tag)
+    config["recent_tags"] = recent[:RECENT_TAGS_MAX]
+    config["last_tag"] = tag
+
+
+def rename_recent_tag(config: dict, old_tag: str, new_tag: str) -> None:
+    """Follow a tag rename through the MRU, preserving its position.
+
+    A rename is not a use: the tag keeps its place in the order rather
+    than jumping to the front. Without this the MRU would keep offering
+    a name that no longer exists in the CSV, and last_tag would drift
+    away from recent_tags[0] the moment the active tag was renamed.
+
+    If the new name is already present, the two entries merge and the
+    earlier (more recent) position wins — mirroring the way rename_tag
+    folds colliding rows together in storage.
+    """
+    old_tag = (old_tag or "").strip()
+    new_tag = (new_tag or "").strip()
+    if not old_tag or not new_tag or old_tag == new_tag:
+        return
+
+    renamed = [
+        new_tag if t == old_tag else t
+        for t in config.get("recent_tags", [])
+    ]
+    deduped: list[str] = []
+    for t in renamed:
+        if t not in deduped:
+            deduped.append(t)
+    config["recent_tags"] = deduped[:RECENT_TAGS_MAX]
+
+    if (config.get("last_tag") or "").strip() == old_tag:
+        config["last_tag"] = new_tag
+
+
+# ------------------------------------------------------------------
 # Seed-mode lookup
 # ------------------------------------------------------------------
 
