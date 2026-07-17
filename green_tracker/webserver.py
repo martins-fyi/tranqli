@@ -9,18 +9,33 @@ The server runs on a daemon thread inside the desktop app's process — no
 separate executable, no system service. Storage is decoupled via callbacks
 so this module doesn't import storage.py directly; main.py wires the two.
 
-Wiring (in main.py):
+Wiring (in main.py's TrackerApp.__init__):
 
-    server = CsvEditorServer(
-        read_rows=storage.read_rows,
-        write_rows=storage.write_rows,
+    self.csv_editor = CsvEditorServer(
+        read_rows=self._read_rows_for_web,
+        write_rows=self._write_rows_for_web,
+        rename_tag=self._rename_tag_for_web,
     )
     # bound for the menu callback:
-    open_csv_editor = server.open_in_browser
+    open_csv_editor = self.csv_editor.open_in_browser
+
+The callbacks are main.py methods, not storage functions passed straight
+through. They wrap storage and then repair app state the web edit
+invalidates — _write_rows_for_web calls storage.save_sessions and then
+re-seeds the widget's carry, since editing today's active-tag row
+otherwise leaves the on-screen total stale; _rename_tag_for_web
+additionally re-points the live tracker if the tag being renamed is the
+one currently running. Going straight to storage would skip that.
 
 The browser POSTs the full rows array back on Save; the server validates
 each row and hands the whole list to write_rows, which crash-safely
-overwrites the CSV (brief §10 — write-temp-then-os.replace).
+overwrites the CSV (brief §10 — write-temp-then-os.replace) and records
+an undo snapshot (spec §5). Both happen inside storage.save_sessions, so
+this module gets them without knowing they exist.
+
+This server's request handlers run on the Flask daemon thread while the
+widget mutates from Qt's main thread. Storage serialises those writers
+internally; nothing here needs to lock.
 """
 
 from __future__ import annotations

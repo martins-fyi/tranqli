@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -222,6 +223,41 @@ class TestAtomicSessionWrite:
     def test_no_tmp_left_behind_on_success(self):
         save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
         assert not _tmp_path_for(get_csv_path()).exists()
+
+    def test_concurrent_mutations_do_not_lose_changes(self, monkeypatch):
+        # The load-modify-save race: two threads both load the same rows,
+        # both apply their own change to that snapshot, and the later
+        # save writes a version derived from pre-change state — silently
+        # dropping the earlier thread's work. Locking only the file write
+        # does not help; the lock has to span the load too.
+        #
+        # merge_into runs between commit_session's load and its save, so
+        # stalling it widens the existing window to something a test can
+        # observe rather than hit by luck. Without the wide lock every
+        # thread loads the same empty file and the last save wins, so
+        # exactly one row survives instead of eight.
+        import green_tracker.storage as st
+
+        real_merge_into = st.merge_into
+
+        def slow_merge_into(sessions, new_row):
+            time.sleep(0.02)
+            return real_merge_into(sessions, new_row)
+
+        monkeypatch.setattr(st, "merge_into", slow_merge_into)
+
+        def add(n):
+            commit_session(f"tag{n}", "2026-05-28", 10)
+
+        threads = [threading.Thread(target=add, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        rows = load_sessions()
+        assert sorted(r.tag for r in rows) == [f"tag{n}" for n in range(8)]
+        assert all(r.minutes == 10 for r in rows)
 
     def test_concurrent_writers_do_not_collide(self):
         # The web editor saves on Flask's thread while the widget saves

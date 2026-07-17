@@ -146,14 +146,25 @@ def load_sessions() -> list[SessionRow]:
         ]
 
 
-# Serialises the stage-then-rename below. The tmp path is derived from
-# the target, so concurrent writers to one file would otherwise share a
-# single tmp: the first rename moves it away and the second fails on a
-# file that no longer exists. Reachable in practice — the web editor
-# saves on Flask's thread while the widget saves on Qt's. Only same-
-# process writers are covered; the app is single-instance, and two
-# processes over one data dir would race on far more than the tmp.
-_csv_write_lock = threading.Lock()
+# Serialises CSV mutation. Held across a whole read-modify-write — load
+# the rows, apply the change, save — not merely the file write, because
+# the damaging race is wider than the write itself: two threads that both
+# load, then both save, each write a version derived from the same
+# starting rows and the later save silently drops the earlier one's
+# change. Narrower locking also leaves concurrent writers sharing one
+# derived tmp path, where the first rename moves it away and the second
+# dies on a file that no longer exists.
+#
+# Reachable in practice: the web editor saves on Flask's thread while the
+# widget saves on Qt's. Covers same-process writers only — the app is
+# single-instance, and two processes over one data dir would race on far
+# more than this.
+#
+# Reentrant because the mutators hold it and then call save_sessions,
+# which acquires it again; a plain Lock would deadlock on the nesting.
+# Always taken before _undo_lock where both are held, so the ordering
+# cannot invert into a deadlock.
+_csv_lock = threading.RLock()
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -168,7 +179,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """
     _ensure_dir()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with _csv_write_lock:
+    with _csv_lock:
         try:
             tmp.write_bytes(data)
             os.replace(tmp, path)
@@ -203,14 +214,22 @@ def _write_sessions(sessions: list[SessionRow]) -> None:
 
 
 def save_sessions(sessions: list[SessionRow]) -> None:
-    """Persist rows, recording the pre-write state for undo (spec §5)."""
-    snapshot = _capture_undo_snapshot()
-    _write_sessions(sessions)
-    # Recorded only once the write has actually landed. The snapshot is
-    # of the pre-write state either way, so this preserves the spec's
-    # "snapshot before the write" semantics while keeping a write that
-    # raised — leaving the file untouched — from pushing a no-op entry.
-    _push_undo_snapshot(snapshot)
+    """Persist rows, recording the pre-write state for undo (spec §5).
+
+    Callers that derived `sessions` from a prior load should hold
+    _csv_lock across both, so the rows they modified are still the rows
+    on disk. The mutators below do; this is also safe to call bare with
+    a complete row set, as the web editor does.
+    """
+    with _csv_lock:
+        snapshot = _capture_undo_snapshot()
+        _write_sessions(sessions)
+        # Recorded only once the write has actually landed. The snapshot
+        # is of the pre-write state either way, so this preserves the
+        # spec's "snapshot before the write" semantics while keeping a
+        # write that raised — leaving the file untouched — from pushing
+        # a no-op entry.
+        _push_undo_snapshot(snapshot)
 
 
 # ------------------------------------------------------------------
@@ -284,22 +303,29 @@ def undo() -> bool:
     records nothing itself — there is no redo (spec §5), and a restore
     that pushed its own snapshot would make undo un-undoable and burn a
     stack slot per press.
-    """
-    with _undo_lock:
-        if not _undo_stack:
-            return False
-        snapshot = _undo_stack.pop()
 
-    path = get_csv_path()
-    if snapshot is None:
-        # The pre-write state had no CSV at all.
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    Holds _csv_lock across pop-and-restore: popping a snapshot and then
+    writing it is itself a read-modify-write, and a mutation landing in
+    between would be silently reverted by the restore that follows it.
+    _csv_lock is taken before _undo_lock here, matching save_sessions, so
+    the two orderings can't invert.
+    """
+    with _csv_lock:
+        with _undo_lock:
+            if not _undo_stack:
+                return False
+            snapshot = _undo_stack.pop()
+
+        path = get_csv_path()
+        if snapshot is None:
+            # The pre-write state had no CSV at all.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        _atomic_write_bytes(path, snapshot)
         return True
-    _atomic_write_bytes(path, snapshot)
-    return True
 
 
 # ------------------------------------------------------------------
@@ -331,9 +357,10 @@ def commit_session(
     if session_name is None:
         session_name = f"{tag}-{date_str}"
     new_row = SessionRow(date=date_str, tag=tag, session_name=session_name, minutes=minutes)
-    sessions = load_sessions()
-    sessions = merge_into(sessions, new_row)
-    save_sessions(sessions)
+    with _csv_lock:
+        sessions = load_sessions()
+        sessions = merge_into(sessions, new_row)
+        save_sessions(sessions)
 
 
 def set_minutes_for_tag_date(
@@ -356,23 +383,24 @@ def set_minutes_for_tag_date(
       "no row for an empty day" invariant.
     - minutes == 0, no row: no-op.
     """
-    sessions = load_sessions()
-    for i, row in enumerate(sessions):
-        if row.tag == tag and row.date == date_str:
-            if minutes == 0:
-                sessions.pop(i)
-            else:
-                sessions[i] = row._replace(minutes=minutes)
+    with _csv_lock:
+        sessions = load_sessions()
+        for i, row in enumerate(sessions):
+            if row.tag == tag and row.date == date_str:
+                if minutes == 0:
+                    sessions.pop(i)
+                else:
+                    sessions[i] = row._replace(minutes=minutes)
+                save_sessions(sessions)
+                return
+        if minutes > 0:
+            if session_name is None:
+                session_name = f"{tag}-{date_str}"
+            sessions.append(SessionRow(
+                date=date_str, tag=tag,
+                session_name=session_name, minutes=minutes,
+            ))
             save_sessions(sessions)
-            return
-    if minutes > 0:
-        if session_name is None:
-            session_name = f"{tag}-{date_str}"
-        sessions.append(SessionRow(
-            date=date_str, tag=tag,
-            session_name=session_name, minutes=minutes,
-        ))
-        save_sessions(sessions)
 
 
 # ------------------------------------------------------------------
@@ -420,25 +448,27 @@ def tag_totals(sessions: list[SessionRow] | None = None) -> dict[str, str]:
 
 def rename_session(old_name: str, new_name: str) -> bool:
     """Rename a session by session_name. Returns True if found and renamed."""
-    sessions = load_sessions()
-    updated = [
-        row._replace(session_name=new_name) if row.session_name == old_name else row
-        for row in sessions
-    ]
-    if updated == list(sessions):
-        return False
-    save_sessions(updated)
-    return True
+    with _csv_lock:
+        sessions = load_sessions()
+        updated = [
+            row._replace(session_name=new_name) if row.session_name == old_name else row
+            for row in sessions
+        ]
+        if updated == list(sessions):
+            return False
+        save_sessions(updated)
+        return True
 
 
 def delete_session(session_name: str) -> bool:
     """Delete a session by session_name. Returns True if found and deleted."""
-    sessions = load_sessions()
-    kept = [row for row in sessions if row.session_name != session_name]
-    if len(kept) == len(sessions):
-        return False
-    save_sessions(kept)
-    return True
+    with _csv_lock:
+        sessions = load_sessions()
+        kept = [row for row in sessions if row.session_name != session_name]
+        if len(kept) == len(sessions):
+            return False
+        save_sessions(kept)
+        return True
 
 
 def retag_session(session_name: str, new_tag: str) -> bool:
@@ -450,34 +480,35 @@ def retag_session(session_name: str, new_tag: str) -> bool:
     minutes are summed into the existing one and the renamed row is
     dropped. This preserves the "one row per (tag, date)" invariant.
     """
-    sessions = load_sessions()
-    target_idx = None
-    for i, row in enumerate(sessions):
-        if row.session_name == session_name:
-            target_idx = i
-            break
-    if target_idx is None:
-        return False
+    with _csv_lock:
+        sessions = load_sessions()
+        target_idx = None
+        for i, row in enumerate(sessions):
+            if row.session_name == session_name:
+                target_idx = i
+                break
+        if target_idx is None:
+            return False
 
-    target = sessions[target_idx]
-    if target.tag == new_tag:
-        return True  # no-op, nothing to do
+        target = sessions[target_idx]
+        if target.tag == new_tag:
+            return True  # no-op, nothing to do
 
-    # Look for a collision with another (tag, date) row.
-    for i, row in enumerate(sessions):
-        if i == target_idx:
-            continue
-        if row.tag == new_tag and row.date == target.date:
-            # Merge target's minutes into the existing row, drop target.
-            sessions[i] = row._replace(minutes=row.minutes + target.minutes)
-            sessions.pop(target_idx)
-            save_sessions(sessions)
-            return True
+        # Look for a collision with another (tag, date) row.
+        for i, row in enumerate(sessions):
+            if i == target_idx:
+                continue
+            if row.tag == new_tag and row.date == target.date:
+                # Merge target's minutes into the existing row, drop target.
+                sessions[i] = row._replace(minutes=row.minutes + target.minutes)
+                sessions.pop(target_idx)
+                save_sessions(sessions)
+                return True
 
-    # No collision — straight tag swap.
-    sessions[target_idx] = target._replace(tag=new_tag)
-    save_sessions(sessions)
-    return True
+        # No collision — straight tag swap.
+        sessions[target_idx] = target._replace(tag=new_tag)
+        save_sessions(sessions)
+        return True
 
 
 def rename_tag(old_tag: str, new_tag: str) -> bool:
@@ -504,44 +535,45 @@ def rename_tag(old_tag: str, new_tag: str) -> bool:
     if not old_tag or not new_tag or old_tag == new_tag:
         return False
 
-    sessions = load_sessions()
+    with _csv_lock:
+        sessions = load_sessions()
 
-    # Index existing new_tag rows by date — these are potential merge
-    # targets when we encounter an old_tag row on the same date.
-    new_by_date: dict[str, int] = {
-        row.date: i for i, row in enumerate(sessions) if row.tag == new_tag
-    }
+        # Index existing new_tag rows by date — these are potential merge
+        # targets when we encounter an old_tag row on the same date.
+        new_by_date: dict[str, int] = {
+            row.date: i for i, row in enumerate(sessions) if row.tag == new_tag
+        }
 
-    affected = False
-    drop_indices: list[int] = []
-    for i, row in enumerate(sessions):
-        if row.tag != old_tag:
-            continue
-        affected = True
-        if row.date in new_by_date:
-            # Collision — merge into the existing new_tag row.
-            target_idx = new_by_date[row.date]
-            target = sessions[target_idx]
-            sessions[target_idx] = target._replace(
-                minutes=target.minutes + row.minutes,
-            )
-            drop_indices.append(i)
-        else:
-            # No collision — rename in place. Register the row as a
-            # merge target for any subsequent old_tag rows on the same
-            # date (shouldn't happen given the storage invariant, but
-            # keeps the loop self-consistent).
-            sessions[i] = row._replace(tag=new_tag)
-            new_by_date[row.date] = i
+        affected = False
+        drop_indices: list[int] = []
+        for i, row in enumerate(sessions):
+            if row.tag != old_tag:
+                continue
+            affected = True
+            if row.date in new_by_date:
+                # Collision — merge into the existing new_tag row.
+                target_idx = new_by_date[row.date]
+                target = sessions[target_idx]
+                sessions[target_idx] = target._replace(
+                    minutes=target.minutes + row.minutes,
+                )
+                drop_indices.append(i)
+            else:
+                # No collision — rename in place. Register the row as a
+                # merge target for any subsequent old_tag rows on the same
+                # date (shouldn't happen given the storage invariant, but
+                # keeps the loop self-consistent).
+                sessions[i] = row._replace(tag=new_tag)
+                new_by_date[row.date] = i
 
-    if not affected:
-        return False
+        if not affected:
+            return False
 
-    # Drop merged rows in reverse so earlier indices stay valid.
-    for i in sorted(drop_indices, reverse=True):
-        sessions.pop(i)
-    save_sessions(sessions)
-    return True
+        # Drop merged rows in reverse so earlier indices stay valid.
+        for i in sorted(drop_indices, reverse=True):
+            sessions.pop(i)
+        save_sessions(sessions)
+        return True
 
 
 # ------------------------------------------------------------------
