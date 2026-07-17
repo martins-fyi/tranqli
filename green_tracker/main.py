@@ -801,6 +801,7 @@ class App:
             rename_tag=self._rename_tag_for_web,
             undo=self._undo_for_web,
             can_undo=storage.can_undo,
+            tag_color=self._tag_color_for_web,
         )
 
         # ---- Wire signals ------------------------------------------------
@@ -2747,6 +2748,11 @@ class App:
             return False
         self._refresh_carry_from_storage()
         return True
+
+    def _tag_color_for_web(self, tag: str) -> str:
+        """Web editor's tag colour for the filter chips: the archive's
+        _tag_color as a "#rrggbb" string (the resolver returns a QColor)."""
+        return self._tag_color(tag).name()
 
     def _rename_tag_for_web(self, old_tag: str, new_tag: str) -> bool:
         """Web wrapper for storage.rename_tag that also refreshes the

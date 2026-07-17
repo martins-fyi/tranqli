@@ -196,6 +196,30 @@ _HTML = r"""<!DOCTYPE html>
      enabled state (empty stack → nothing to undo). */
   button.icon-btn:disabled { cursor: default; opacity: 0.35; }
   button.icon-btn:disabled:hover { background: var(--card-bg); }
+  /* Tag filter bar — view-only; hidden rows still save. */
+  .tag-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 1.25rem;
+  }
+  .tag-filter:empty { display: none; }
+  .filter-chip {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-left-width: 4px;                 /* accent stripe = tag colour */
+    border-radius: 4px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 100ms, border-color 100ms;
+  }
+  .filter-chip:hover { background: #efece4; }
+  .filter-chip.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
   #status {
     margin-left: auto;
     color: var(--text-muted);
@@ -258,6 +282,8 @@ _HTML = r"""<!DOCTYPE html>
   <h1>Sessions</h1>
   <div class="section-label">Tag totals</div>
   <div id="tag-totals" class="tag-totals"></div>
+  <div class="section-label">Filter</div>
+  <div id="tag-filter" class="tag-filter"></div>
   <table>
     <thead>
       <tr>
@@ -282,6 +308,14 @@ _HTML = r"""<!DOCTYPE html>
 </div>
 <script>
 const KEYS = ['date', 'tag', 'session_name', 'minutes'];
+
+// View-only tag filter. `activeFilter` null = show all; otherwise the
+// tag whose rows are shown. Filtering only toggles row visibility — every
+// row stays in the DOM, so collectRows() (and therefore save and undo)
+// sees the full set regardless of what's filtered. `tagColors` mirrors the
+// archive's per-tag colour, fetched best-effort to tint the filter chips.
+let activeFilter = null;
+let tagColors = {};
 
 // Format an integer minutes value as "Xd Xh Xm" with cascading
 // omission of leading zero fields. Mirrors _format_dhm in main.py
@@ -334,6 +368,7 @@ function parseDhm(s) {
 
 async function loadRows() {
   try {
+    await loadTagColors();
     const res = await fetch('/api/rows');
     const rows = await res.json();
     renderRows(rows);
@@ -388,6 +423,8 @@ function renderRows(rows) {
     tr.appendChild(td);
     tbody.appendChild(tr);
     renderTagTotals([]);
+    activeFilter = null;
+    renderFilterBar([]);
     return;
   }
   rows.forEach((row, i) => {
@@ -424,6 +461,13 @@ function renderRows(rows) {
     tbody.appendChild(tr);
   });
   renderTagTotals(rows);
+  // If the active filter's tag no longer exists (renamed/all deleted),
+  // fall back to All so the table isn't left mysteriously empty.
+  if (activeFilter !== null && !distinctTags(rows).includes(activeFilter)) {
+    activeFilter = null;
+  }
+  renderFilterBar(rows);
+  applyFilterVisibility();
 }
 
 // Sum minutes per tag across the current rows and render them as
@@ -459,6 +503,67 @@ function renderTagTotals(rows) {
     chip.appendChild(totalSpan);
     container.appendChild(chip);
   });
+}
+
+// Fetch the archive's per-tag colours so the filter chips can match them.
+// Best-effort: on any failure the chips just render without accent tint.
+async function loadTagColors() {
+  try {
+    const res = await fetch('/api/tag_colors');
+    if (res.ok) tagColors = await res.json();
+  } catch (e) { /* chips fall back to the default border */ }
+}
+
+// Distinct non-empty tags across the current rows, in first-seen order.
+function distinctTags(rows) {
+  const seen = [];
+  rows.forEach(r => {
+    const t = String(r.tag == null ? '' : r.tag).trim();
+    if (t && !seen.includes(t)) seen.push(t);
+  });
+  return seen;
+}
+
+// Toggle the filter. Clicking "All" (tag == null) or the already-active
+// tag clears it; any other tag becomes the active filter.
+function setFilter(tag) {
+  activeFilter = (tag === null || tag === activeFilter) ? null : tag;
+  applyFilterVisibility();
+  renderFilterBar(collectRows());
+}
+
+// Show only rows whose current tag matches the active filter. Reads each
+// row's live tag input, so it respects edits made since the last render.
+// Purely visual: rows set to display:none stay in the DOM and still POST.
+function applyFilterVisibility() {
+  document.querySelectorAll('#rows tr').forEach(tr => {
+    const tagInput = tr.querySelector('input[data-key=\"tag\"]');
+    if (!tagInput) return;   // the "no sessions" placeholder row
+    const tag = tagInput.value.trim();
+    tr.style.display = (activeFilter === null || tag === activeFilter) ? '' : 'none';
+  });
+}
+
+// Build the filter bar: an "All" chip plus one per distinct tag, the
+// active one highlighted. Each tag chip carries its archive colour as a
+// left accent stripe when available.
+function renderFilterBar(rows) {
+  const bar = document.getElementById('tag-filter');
+  bar.innerHTML = '';
+  const tags = distinctTags(rows);
+  if (tags.length === 0) return;   // nothing to filter; :empty hides the bar
+
+  const mkChip = (label, tag, color) => {
+    const chip = document.createElement('div');
+    chip.className = 'filter-chip' + (tag === activeFilter ? ' active' : '');
+    chip.textContent = label;
+    if (color) chip.style.borderLeftColor = color;
+    chip.onclick = () => setFilter(tag);
+    return chip;
+  };
+  // "All" clears the filter (tag null); active when nothing is filtered.
+  bar.appendChild(mkChip('All', null, null));
+  tags.forEach(tag => bar.appendChild(mkChip(tag, tag, tagColors[tag])));
 }
 
 // Prompt for a new name and POST to /api/rename_tag. Reloads from
@@ -539,6 +644,9 @@ function addRow() {
     session_name: tag,
     minutes: 0,
   });
+  // A new row's tag won't match an active filter, so clear it — otherwise
+  // the row you just added would be added but hidden.
+  activeFilter = null;
   renderRows(rows);
 }
 
@@ -632,6 +740,7 @@ class CsvEditorServer:
                  rename_tag: Optional[Callable[[str, str], bool]] = None,
                  undo:       Optional[Callable[[], bool]] = None,
                  can_undo:   Optional[Callable[[], bool]] = None,
+                 tag_color:  Optional[Callable[[str], str]] = None,
                  host: str = HOST,
                  port: int = PORT) -> None:
         self._read_rows  = read_rows
@@ -643,6 +752,10 @@ class CsvEditorServer:
         # can't reach the Python stack directly, hence these callbacks (§5).
         self._undo       = undo
         self._can_undo   = can_undo
+        # tag_color(tag) -> "#rrggbb", the archive's per-tag colour. Only
+        # used to tint the filter chips (a nice-to-have); optional, so the
+        # page renders fine when it's not wired.
+        self._tag_color  = tag_color
         self._host       = host
         self._port       = port
         self._app:    Optional[Flask]            = None
@@ -764,5 +877,24 @@ class CsvEditorServer:
                 return jsonify({"error": f"undo failed: {e}"}), 500
             can = bool(self._can_undo()) if self._can_undo is not None else False
             return jsonify({"ok": True, "undone": undone, "can_undo": can})
+
+        @app.route("/api/tag_colors", methods=["GET"])
+        def _api_tag_colors():
+            """Per-tag colours for tinting the filter chips (nice-to-have).
+
+            Maps each distinct tag currently in the CSV to its archive
+            colour. Returns {} when tag_color isn't wired, so the chips
+            just render without an accent stripe."""
+            if self._tag_color is None:
+                return jsonify({})
+            tags = {r.get("tag") for r in self._read_rows()}
+            colors = {}
+            for tag in tags:
+                if tag:
+                    try:
+                        colors[tag] = self._tag_color(tag)
+                    except Exception:
+                        pass  # skip a tag that fails rather than 500 the page
+            return jsonify(colors)
 
         self._app = app
