@@ -1076,6 +1076,11 @@ class App:
         self.tracker.set_tag(last_tag)
         self._session_started = True
         self._carry_seconds = today_mins * 60
+        # Auto-resume binds the tag directly rather than through
+        # on_set_tag, so apply its scheme here too — otherwise a resumed
+        # tag with its own scheme would launch in the global one until the
+        # next switch.
+        self._apply_tag_scheme(last_tag)
         # Mirrors the post-set-tag bookkeeping in on_set_tag so the
         # rest of the app's state stays consistent. _update_running_
         # _state pushes the (still PAUSED) state to widget, tray,
@@ -1156,6 +1161,39 @@ class App:
             self._session_started = True
         self.tracker.toggle()
         self._update_running_state()
+
+    def _apply_tag_scheme(self, tag: Optional[str]) -> None:
+        """Repaint in `tag`'s colour scheme (§2c step 4).
+
+        tag_schemes holds per-tag overrides; a tag without one shows the
+        global color_scheme rather than keeping whatever is on screen, so
+        an unstyled tag always looks the same instead of inheriting the
+        appearance of whichever tag you happened to switch from.
+
+        Stores scheme *keys* ("earthen"), not the display names ("Earthen")
+        spec §1's example shows. config["color_scheme"] and set_scheme()
+        both speak keys, and COLOR_SCHEMES is keyed by them — a display
+        name would miss every lookup and silently fall back to Earthen,
+        which looks like "per-tag schemes don't work" rather than like a
+        type error.
+
+        Deliberately does not write config. This reflects a choice; it
+        does not make one. Writing the current scheme back onto a tag with
+        no preference — §2c step 4's optional "so it sticks" — would pin
+        every tag to whatever was showing the first time it was picked,
+        which is not a preference, just an accident of order.
+        """
+        schemes = self.config.get("tag_schemes") or {}
+        key = schemes.get(tag) if tag else None
+        if not key:
+            key = self.config.get("color_scheme", DEFAULT_SCHEME_NAME)
+        if key not in COLOR_SCHEMES:
+            # Corrupt or hand-edited config, or a scheme we retired.
+            key = DEFAULT_SCHEME_NAME
+        if key == self._current_scheme:
+            return
+        self._current_scheme = key
+        self.widget.set_scheme(key)
 
     def _prompt_new_tag_text(self, first_ever: bool = False) -> Optional[str]:
         """Ask for a new tag's name. None if cancelled or left blank.
@@ -1423,6 +1461,11 @@ class App:
         self.tracker.set_tag(tag)
         storage.push_recent_tag(self.config, tag)
         storage.save_config(self.config)
+        # Hooked here rather than in on_switch_tag so every bind repaints:
+        # the launch gate, Switch Tags, New Tag and Retag session all pass
+        # through this method, and a widget showing the previous tag's
+        # colours after any of them would be wrong in the same way.
+        self._apply_tag_scheme(tag)
         self._carry_seconds = (
             storage.today_minutes_for_tag(tag, self._today_str()) * 60
         )
