@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 
 import pytest
 
@@ -7,7 +8,10 @@ from green_tracker.storage import (
     CURRENT_CONFIG_VERSION,
     FIELDNAMES,
     RECENT_TAGS_MAX,
+    UNDO_STACK_DEPTH,
     SessionRow,
+    can_undo,
+    clear_undo_stack,
     commit_session,
     delete_session,
     format_tag_total,
@@ -17,9 +21,14 @@ from green_tracker.storage import (
     load_sessions,
     merge_into,
     rename_session,
+    rename_tag,
+    retag_session,
     save_config,
     save_sessions,
+    set_minutes_for_tag_date,
     tag_totals,
+    undo,
+    undo_depth,
 )
 
 
@@ -214,6 +223,35 @@ class TestAtomicSessionWrite:
         save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
         assert not _tmp_path_for(get_csv_path()).exists()
 
+    def test_concurrent_writers_do_not_collide(self):
+        # The web editor saves on Flask's thread while the widget saves
+        # on Qt's. The tmp path is derived from the target, so without
+        # serialisation both writers stage through the same file: the
+        # first rename moves it away and the second dies on a tmp that
+        # no longer exists.
+        errors = []
+
+        def hammer(n):
+            for i in range(20):
+                try:
+                    save_sessions([
+                        SessionRow("2026-05-28", f"t{n}", f"s{n}-{i}", i + 1),
+                    ])
+                except Exception as exc:      # noqa: BLE001 - reported below
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=hammer, args=(n,)) for n in range(6)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(load_sessions()) == 1      # last writer wins, intact
+        assert not _tmp_path_for(get_csv_path()).exists()
+
     def test_no_tmp_left_behind_on_failure(self, monkeypatch):
         save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
 
@@ -224,6 +262,136 @@ class TestAtomicSessionWrite:
         with pytest.raises(OSError):
             save_sessions([SessionRow("2026-05-29", "coding", "c-1", 999)])
         assert not _tmp_path_for(get_csv_path()).exists()
+
+
+# ---------------------------------------------------------------------------
+# Undo stack (spec §5)
+# ---------------------------------------------------------------------------
+
+class TestUndo:
+    def test_nothing_to_undo_on_empty_stack(self):
+        assert can_undo() is False
+        assert undo() is False
+
+    def test_undo_restores_previous_csv(self):
+        first = [SessionRow("2026-05-28", "email", "e-1", 60)]
+        save_sessions(first)
+        save_sessions([SessionRow("2026-05-29", "coding", "c-1", 120)])
+        assert undo() is True
+        assert load_sessions() == first
+
+    def test_undo_of_first_ever_save_removes_the_file(self):
+        # The pre-write state had no CSV. Restoring must delete it, not
+        # leave a header-only file that reads as "a real but empty
+        # history".
+        assert not get_csv_path().exists()
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        assert undo() is True
+        assert not get_csv_path().exists()
+        assert load_sessions() == []
+
+    def test_undo_is_lifo_to_full_depth(self):
+        # Spec §5's stated test: undo up to 8 deep, each step matching
+        # the state before that write.
+        states = []
+        for i in range(UNDO_STACK_DEPTH):
+            states.append(load_sessions())
+            save_sessions([
+                SessionRow("2026-05-28", f"tag{i}", f"s{i}", (i + 1) * 10),
+            ])
+        assert undo_depth() == UNDO_STACK_DEPTH
+        for expected in reversed(states):
+            assert undo() is True
+            assert load_sessions() == expected
+        assert can_undo() is False
+
+    def test_stack_evicts_oldest_beyond_depth(self):
+        for i in range(UNDO_STACK_DEPTH + 5):
+            save_sessions([
+                SessionRow("2026-05-28", f"tag{i}", f"s{i}", i + 1),
+            ])
+        assert undo_depth() == UNDO_STACK_DEPTH
+
+    def test_undo_does_not_stack_itself(self):
+        # No redo: an undo must not push its own snapshot, or it would
+        # be un-undoable and would burn a slot per press.
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        save_sessions([SessionRow("2026-05-29", "coding", "c-1", 120)])
+        depth_before = undo_depth()
+        undo()
+        assert undo_depth() == depth_before - 1
+
+    def test_every_mutating_entry_point_is_undoable(self):
+        # Spec §2d: all CSV mutations push a snapshot, whatever the
+        # entry point. They all funnel through save_sessions, so this
+        # guards that funnel staying intact.
+        base = [
+            SessionRow("2026-05-28", "email", "e-1", 60),
+            SessionRow("2026-05-28", "coding", "c-1", 30),
+        ]
+        for mutate in (
+            lambda: commit_session("email", "2026-05-28", 15),
+            lambda: rename_session("e-1", "renamed"),
+            lambda: delete_session("c-1"),
+            lambda: retag_session("e-1", "admin"),
+            lambda: rename_tag("email", "work"),
+            lambda: set_minutes_for_tag_date("email", "2026-05-28", 99),
+        ):
+            save_sessions(base)
+            clear_undo_stack()
+            mutate()
+            assert undo_depth() == 1, mutate
+            assert undo() is True
+            assert load_sessions() == base, mutate
+
+    def test_noop_mutations_do_not_consume_the_stack(self):
+        # rename/delete/retag return early without writing when there's
+        # nothing to do, so they must not burn an undo slot.
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        clear_undo_stack()
+        assert rename_session("nosuch", "x") is False
+        assert delete_session("nosuch") is False
+        assert retag_session("nosuch", "x") is False
+        assert rename_tag("nosuch", "x") is False
+        assert undo_depth() == 0
+
+    def test_failed_write_does_not_push_a_snapshot(self, monkeypatch):
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        clear_undo_stack()
+
+        def boom(*args, **kwargs):
+            raise OSError("simulated failure mid-write")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            save_sessions([SessionRow("2026-05-29", "coding", "c-1", 999)])
+        assert undo_depth() == 0
+
+    def test_undo_restore_is_atomic(self, monkeypatch):
+        # An interrupted undo must not damage the file it's repairing.
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        current = [SessionRow("2026-05-29", "coding", "c-1", 120)]
+        save_sessions(current)
+        before = get_csv_path().read_bytes()
+
+        def boom(*args, **kwargs):
+            raise OSError("simulated failure mid-restore")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            undo()
+        assert get_csv_path().read_bytes() == before
+        assert load_sessions() == current
+        assert not _tmp_path_for(get_csv_path()).exists()
+
+    def test_snapshots_are_byte_exact(self):
+        # Snapshot is raw bytes, not re-serialised rows, so CRLF and any
+        # hand-edited formatting survive a round trip.
+        save_sessions([SessionRow("2026-05-28", "email", "e-1", 60)])
+        before = get_csv_path().read_bytes()
+        save_sessions([SessionRow("2026-05-29", "coding", "c-1", 120)])
+        undo()
+        assert get_csv_path().read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

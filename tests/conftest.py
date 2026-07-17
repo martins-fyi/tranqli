@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from green_tracker import storage
+
 
 @pytest.fixture(autouse=True)
 def isolate_data_dir(tmp_path, monkeypatch):
@@ -40,3 +42,18 @@ def isolate_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(
         Path, "home", classmethod(lambda cls: tmp_path / "home"),
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_undo_stack():
+    """Empty the undo stack around every test.
+
+    The stack is module-level state in storage, so it outlives any single
+    test even though isolate_data_dir gives each one a fresh directory.
+    Left alone, a snapshot pushed by one test is poppable by the next —
+    and worse, it holds CSV bytes belonging to a temp dir that no longer
+    exists. Cleared on the way in and out so order can't matter.
+    """
+    storage.clear_undo_stack()
+    yield
+    storage.clear_undo_stack()

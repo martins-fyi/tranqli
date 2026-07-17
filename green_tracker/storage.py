@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import threading
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -145,6 +146,16 @@ def load_sessions() -> list[SessionRow]:
         ]
 
 
+# Serialises the stage-then-rename below. The tmp path is derived from
+# the target, so concurrent writers to one file would otherwise share a
+# single tmp: the first rename moves it away and the second fails on a
+# file that no longer exists. Reachable in practice — the web editor
+# saves on Flask's thread while the widget saves on Qt's. Only same-
+# process writers are covered; the app is single-instance, and two
+# processes over one data dir would race on far more than the tmp.
+_csv_write_lock = threading.Lock()
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write `data` to `path` crash-safely (brief §10).
 
@@ -157,17 +168,18 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """
     _ensure_dir()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
-    except OSError:
-        # Don't leave a half-written .tmp behind to confuse the next
-        # write (or the user looking at the data dir).
+    with _csv_write_lock:
         try:
-            tmp.unlink()
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
         except OSError:
-            pass
-        raise
+            # Don't leave a half-written .tmp behind to confuse the next
+            # write (or the user looking at the data dir).
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
 
 def _serialize_sessions(sessions: list[SessionRow]) -> bytes:
@@ -191,7 +203,103 @@ def _write_sessions(sessions: list[SessionRow]) -> None:
 
 
 def save_sessions(sessions: list[SessionRow]) -> None:
+    """Persist rows, recording the pre-write state for undo (spec §5)."""
+    snapshot = _capture_undo_snapshot()
     _write_sessions(sessions)
+    # Recorded only once the write has actually landed. The snapshot is
+    # of the pre-write state either way, so this preserves the spec's
+    # "snapshot before the write" semantics while keeping a write that
+    # raised — leaving the file untouched — from pushing a no-op entry.
+    _push_undo_snapshot(snapshot)
+
+
+# ------------------------------------------------------------------
+# Undo stack (spec §5)
+# ------------------------------------------------------------------
+
+# LIFO stack of whole-CSV snapshots, oldest first, capped at
+# UNDO_STACK_DEPTH. In-memory only and deliberately not persisted: undo
+# is a within-session convenience, and a stack on disk would be a second
+# crash-safety surface to keep consistent with the CSV it describes.
+UNDO_STACK_DEPTH = 8
+
+# A snapshot is the CSV's raw bytes, or None meaning "no CSV existed
+# yet". None is not the same as empty bytes: undoing the first-ever save
+# must remove the file, not leave a header-only one behind.
+_undo_stack: list[Optional[bytes]] = []
+
+# save_sessions is reachable from both the Qt main thread and the Flask
+# thread the web editor runs on (main.py injects _write_rows_for_web as
+# webserver's write_rows callable), so the stack is genuinely shared
+# state. The lock guards the stack only — the pre-existing
+# load-modify-save race between those two writers is unchanged by undo.
+_undo_lock = threading.Lock()
+
+
+def _capture_undo_snapshot() -> Optional[bytes]:
+    """Read the CSV's current bytes for the undo stack.
+
+    Best-effort: an unreadable CSV yields None, which undo treats as
+    "restore to no file". Failing to snapshot must never block the save
+    the user actually asked for.
+    """
+    try:
+        return get_csv_path().read_bytes()
+    except OSError:
+        return None
+
+
+def _push_undo_snapshot(snapshot: Optional[bytes]) -> None:
+    with _undo_lock:
+        _undo_stack.append(snapshot)
+        # Evict oldest beyond the cap. Slice-delete is a no-op while the
+        # stack is under depth.
+        del _undo_stack[:-UNDO_STACK_DEPTH]
+
+
+def undo_depth() -> int:
+    """How many mutations can currently be undone."""
+    with _undo_lock:
+        return len(_undo_stack)
+
+
+def can_undo() -> bool:
+    """Whether an undo is available — drives the greyed-out UI states."""
+    with _undo_lock:
+        return bool(_undo_stack)
+
+
+def clear_undo_stack() -> None:
+    """Drop all snapshots. Exists for tests: the stack is module state,
+    so it would otherwise leak across them."""
+    with _undo_lock:
+        _undo_stack.clear()
+
+
+def undo() -> bool:
+    """Restore the most recent snapshot. Returns False if nothing to undo.
+
+    Restores through the same crash-safe path as a normal write, so an
+    interrupted undo can't destroy the file it's repairing. Deliberately
+    records nothing itself — there is no redo (spec §5), and a restore
+    that pushed its own snapshot would make undo un-undoable and burn a
+    stack slot per press.
+    """
+    with _undo_lock:
+        if not _undo_stack:
+            return False
+        snapshot = _undo_stack.pop()
+
+    path = get_csv_path()
+    if snapshot is None:
+        # The pre-write state had no CSV at all.
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    _atomic_write_bytes(path, snapshot)
+    return True
 
 
 # ------------------------------------------------------------------
