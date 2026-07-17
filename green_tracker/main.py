@@ -49,8 +49,8 @@ from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QMenu, QMessageBox, QPushButton, QSpinBox, QStyle,
-    QStyledItemDelegate, QSystemTrayIcon, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout,
+    QStyledItemDelegate, QSystemTrayIcon, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import storage
@@ -608,6 +608,11 @@ class App:
         # When a row already exists, Change session renames it
         # immediately via storage.rename_session and leaves this None.
         self._pending_session_name: Optional[str] = None
+
+        # The archive's QTabWidget while the dialog is open, else None.
+        # Mutation helpers use it to refresh every tab after an edit; the
+        # dialog clears it on close so a stale widget is never touched.
+        self._archive_tabs: Optional[QTabWidget] = None
 
         # ---- Font --------------------------------------------------------
         self._font_family: Optional[str] = self._load_font()
@@ -1951,33 +1956,15 @@ class App:
         dialog.resize(640, 520)
         layout = QVBoxLayout(dialog)
 
-        tree = QTreeWidget()
-        tree.setHeaderLabels(["Date", "Tag", "Session", "Duration"])
-        tree.setColumnWidth(0, 90)
-        tree.setColumnWidth(1, 130)
-        tree.setColumnWidth(2, 220)
-        tree.setRootIsDecorated(True)
-        # Qt's default indentation (~20 px on Windows) leaves an
-        # awkward gutter on the left of every leaf row — there's no
-        # per-row disclosure widget to fill it, and the date text
-        # ends up starting well into the column. 12 px keeps the
-        # hierarchy visible without wasting the column.
-        tree.setIndentation(12)
-        # Tag-based backgrounds replace alternating row colors — leaving
-        # Qt's alternating scheme on top would tint our explicit
-        # setBackground colors on every other row.
-        tree.setAlternatingRowColors(False)
-        # All custom painting (section-header strokes, leaf-row
-        # separator, and selection coloring) is routed through the
-        # delegate. NO `::item` stylesheet rules — any rule there
-        # would trip Qt into stylesheet mode and suppress the per-
-        # item BackgroundRole colors that carry the tag tints.
-        tree.setItemDelegate(_ArchiveItemDelegate(tree))
-        tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        tree.customContextMenuRequested.connect(
-            lambda pos: self._archive_context_menu(tree, pos)
-        )
-        layout.addWidget(tree)
+        # One tab per tag plus an "All" tab (§6a). The tab set is rebuilt
+        # from storage on every mutation, since deleting/merging/renaming
+        # a tag changes which tabs exist — so it is held on the instance
+        # for the mutation helpers to reach, and cleared when the dialog
+        # closes so a stale widget is never repopulated.
+        tabs = QTabWidget()
+        self._archive_tabs = tabs
+        dialog.finished.connect(lambda _=0: setattr(self, "_archive_tabs", None))
+        layout.addWidget(tabs)
 
         # ---- Bottom bar: display-mode toggle + Close ---------------
         # Left-aligned controls for changing how the Duration column
@@ -2025,7 +2012,7 @@ class App:
             self.config["archive_display_mode"] = new_mode
             storage.save_config(self.config)
             hpd_spin.setEnabled(new_mode == "workdays")
-            self._populate_archive_tree(tree)
+            self._rebuild_archive_tabs()
 
         def _on_hpd_changed(val: int) -> None:
             self.config["archive_hours_per_day"] = int(val)
@@ -2033,21 +2020,160 @@ class App:
             # Only repopulate when the change is actually visible —
             # in Hours mode the value is parked, not applied.
             if self.config.get("archive_display_mode") == "workdays":
-                self._populate_archive_tree(tree)
+                self._rebuild_archive_tabs()
 
         mode_combo.currentIndexChanged.connect(_on_mode_changed)
         hpd_spin.valueChanged.connect(_on_hpd_changed)
 
-        self._populate_archive_tree(tree)
+        self._rebuild_archive_tabs()
         dialog.exec()
 
-    def _populate_archive_tree(self, tree: QTreeWidget) -> None:
-        """Build (or rebuild) the tree contents from current storage state."""
+    def _archive_tab_order(self) -> List[str]:
+        """Tags for the per-tag tabs, most-recently-active first (§6a).
+
+        Recency = the tag's newest session date. Ties broken by name so
+        the order is deterministic rather than dependent on CSV order.
+        """
+        last_seen: Dict[str, str] = {}
+        for s in storage.load_sessions():
+            if s.date > last_seen.get(s.tag, ""):
+                last_seen[s.tag] = s.date
+        return sorted(last_seen, key=lambda t: (last_seen[t], t), reverse=True)
+
+    def _archive_tag_accent(self, tag: str) -> QColor:
+        """Accent colour for a tag's tab and its per-tag view.
+
+        Sourced from tag_color_overrides, falling back to the
+        auto-assigned 16-hue archive palette — the same identity the
+        rows carry in the All tab, so a tag looks the same wherever it
+        appears. NOT tag_schemes: that is the widget's colour-scheme
+        selection, a separate system (resolved with the user earlier).
+
+        The palette index follows tab order, so it lines up with the
+        first-appearance assignment _populate_archive_tree makes in the
+        newest-first All view.
+        """
+        override = self.config.get("tag_color_overrides", {}).get(tag)
+        if override:
+            return QColor(override)
+        order = self._archive_tab_order()
+        idx = order.index(tag) if tag in order else 0
+        return _ARCHIVE_TAG_PALETTE[idx % len(_ARCHIVE_TAG_PALETTE)]
+
+    def _make_archive_tree(self) -> QTreeWidget:
+        """Build a wired archive tree — the widget behind every tab.
+
+        Extracted so the All tab and each per-tag tab are configured
+        identically; only the content differs, via _populate_archive_tree's
+        tag_filter. The context menu is wired per tree because the handler
+        needs the specific tree the click landed in.
+        """
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Date", "Tag", "Session", "Duration"])
+        tree.setColumnWidth(0, 90)
+        tree.setColumnWidth(1, 130)
+        tree.setColumnWidth(2, 220)
+        tree.setRootIsDecorated(True)
+        # Qt's default indentation (~20 px on Windows) leaves an
+        # awkward gutter on the left of every leaf row — there's no
+        # per-row disclosure widget to fill it, and the date text
+        # ends up starting well into the column. 12 px keeps the
+        # hierarchy visible without wasting the column.
+        tree.setIndentation(12)
+        # Tag-based backgrounds replace alternating row colors — leaving
+        # Qt's alternating scheme on top would tint our explicit
+        # setBackground colors on every other row.
+        tree.setAlternatingRowColors(False)
+        # All custom painting (section-header strokes, leaf-row
+        # separator, and selection coloring) is routed through the
+        # delegate. NO `::item` stylesheet rules — any rule there
+        # would trip Qt into stylesheet mode and suppress the per-
+        # item BackgroundRole colors that carry the tag tints.
+        tree.setItemDelegate(_ArchiveItemDelegate(tree))
+        tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        tree.customContextMenuRequested.connect(
+            lambda pos, t=tree: self._archive_context_menu(t, pos)
+        )
+        return tree
+
+    def _rebuild_archive_tabs(self) -> None:
+        """Rebuild the whole tab set from storage, preserving selection.
+
+        Called on open and after any change that can alter the tab set —
+        a tag deleted, merged, renamed, or a session edited. Rebuilding
+        wholesale rather than patching one tree keeps the tab list correct
+        when tags appear or vanish; the cost is trivial at these sizes.
+
+        Selection is preserved by the tab's identity (its tag name, or
+        "All"), not its index, since indices shift as tags come and go.
+        """
+        tabs = self._archive_tabs
+        if tabs is None:
+            return
+
+        previous = tabs.tabText(tabs.currentIndex()) if tabs.count() else "All"
+        # Strip the " Dd Hh" suffix off a per-tag label to recover the tag.
+        prev_tag = previous.split("   ")[0] if previous != "All" else "All"
+
+        tabs.blockSignals(True)
+        while tabs.count():
+            tabs.removeTab(0)
+
+        all_tree = self._make_archive_tree()
+        tabs.addTab(all_tree, "All")
+        self._populate_archive_tree(all_tree)
+
+        totals: Dict[str, int] = {}
+        for s in storage.load_sessions():
+            totals[s.tag] = totals.get(s.tag, 0) + s.minutes
+
+        select_index = 0
+        for tag in self._archive_tab_order():
+            tree = self._make_archive_tree()
+            # Lifetime total in the tab label, so the per-tag view needs
+            # no Total rows of its own (§6b).
+            label = f"{tag}   {storage.format_tag_total(totals.get(tag, 0))}"
+            index = tabs.addTab(tree, label)
+            tabs.tabBar().setTabTextColor(index, self._archive_tag_accent(tag))
+            self._populate_archive_tree(tree, tag_filter=tag)
+            if tag == prev_tag:
+                select_index = index
+
+        tabs.blockSignals(False)
+        tabs.setCurrentIndex(select_index)
+
+    def _refresh_archive(self) -> None:
+        """Rebuild the archive if it is open; no-op otherwise.
+
+        The single refresh entry point for archive mutation helpers,
+        replacing their old per-tree repopulate so an edit updates every
+        tab and the tab set at once.
+        """
+        if self._archive_tabs is not None:
+            self._rebuild_archive_tabs()
+
+    def _populate_archive_tree(
+        self, tree: QTreeWidget, tag_filter: Optional[str] = None,
+    ) -> None:
+        """Build (or rebuild) the tree contents from current storage state.
+
+        With `tag_filter` set (a per-tag tab), only that tag's sessions
+        are shown, and the view drops what would be redundant when every
+        row is the same tag (§6b): no per-row colour chips, no per-section
+        Total rows, and no bottom Tags overview. The lifetime total lives
+        in the tab label instead. With no filter (the All tab) the view is
+        exactly as it was before tabs existed.
+        """
         tree.clear()
         sessions = storage.load_sessions()
+        if tag_filter is not None:
+            sessions = [s for s in sessions if s.tag == tag_filter]
         if not sessions:
-            empty = QTreeWidgetItem(["(no saved sessions yet)"])
-            tree.addTopLevelItem(empty)
+            msg = (
+                "(no sessions for this tag)" if tag_filter is not None
+                else "(no saved sessions yet)"
+            )
+            tree.addTopLevelItem(QTreeWidgetItem([msg]))
             return
 
         # Sort newest first. Ties broken by session_name for stability.
@@ -2094,12 +2220,20 @@ class App:
                 ]
                 auto_idx += 1
 
+        # A per-tag tab is a single tag throughout, so the colour chips
+        # and Total rows that distinguish tags in the All view would only
+        # repeat information (§6b). Suppressed together via this flag.
+        chips = tag_filter is None
+
         # --- Recent (always expanded, no nesting) ---
         if recent:
             recent_root = QTreeWidgetItem(["Recent"])
             self._make_header_bold(recent_root)
             tree.addTopLevelItem(recent_root)
-            self._add_tag_groups(recent_root, recent, tag_colors, active_key)
+            self._add_tag_groups(
+                recent_root, recent, tag_colors, active_key,
+                show_chips=chips, show_totals=chips,
+            )
             recent_root.setExpanded(True)
 
         # --- Year → Month groups for everything ---
@@ -2133,6 +2267,7 @@ class App:
                 year_item.addChild(month_item)
                 self._add_tag_groups(
                     month_item, months[month], tag_colors, active_key,
+                    show_chips=chips, show_totals=chips,
                 )
             # Years collapsed by default — keeps the recent list dominant.
 
@@ -2144,6 +2279,13 @@ class App:
         # An empty 24-px spacer row above provides graphical
         # separation from the year/month tree (more breathing room
         # than the standard 1-px section-stroke divider).
+        #
+        # Skipped in a per-tag tab: a one-row overview of the tag whose
+        # tab you are already on is noise, and its lifetime total is in
+        # the tab label (§6b).
+        if tag_filter is not None:
+            return
+
         spacer = QTreeWidgetItem([])
         spacer.setSizeHint(0, QSize(0, 24))
         # Non-selectable so clicking the gap doesn't highlight an
@@ -2182,6 +2324,8 @@ class App:
         sessions: List[storage.SessionRow],
         tag_colors: Dict[str, QColor],
         active_key: Optional[tuple] = None,
+        show_chips: bool = True,
+        show_totals: bool = True,
     ) -> None:
         """Insert sessions under `parent_item`, grouped by tag.
 
@@ -2203,6 +2347,14 @@ class App:
         the "this is the session currently in flight" marker. Only
         the session row matches; the Total summary row never does
         (it's not a real session).
+
+        `show_chips` False leaves session rows on the tree's default
+        background — the per-tag view, where one shared colour would say
+        nothing. `show_totals` False omits the Total summary rows, since
+        a per-tag tab carries its lifetime total in the tab label. The
+        in-progress marker still applies with chips off: it means "this
+        is live", not "this is tag X", so it stays useful in a one-tag
+        view.
         """
         # Group by tag, preserving first-appearance order.
         by_tag: Dict[str, List[storage.SessionRow]] = {}
@@ -2229,14 +2381,18 @@ class App:
                     and s.tag == active_key[0]
                     and s.date == active_key[1]
                 )
-                row_bg = in_progress_brush if is_active else brush
-                for col in range(4):
-                    item.setBackground(col, row_bg)
-                    if is_active:
+                # Chips off: leave the default background unless the row
+                # is the live one, which still earns its rust marker.
+                if is_active:
+                    for col in range(4):
+                        item.setBackground(col, in_progress_brush)
                         item.setForeground(col, in_progress_fg)
+                elif show_chips:
+                    for col in range(4):
+                        item.setBackground(col, brush)
                 parent_item.addChild(item)
             # Total row when 2+ sessions share this tag in this section.
-            if len(tag_sessions) >= 2:
+            if show_totals and len(tag_sessions) >= 2:
                 total_mins = sum(s.minutes for s in tag_sessions)
                 # "Total" label sits in the Tag column (col 1), not
                 # the Session column — this row summarizes a tag, so
@@ -2367,14 +2523,14 @@ class App:
             overrides[tag] = color_hex
         self.config["tag_color_overrides"] = overrides
         storage.save_config(self.config)
-        self._populate_archive_tree(tree)
+        self._refresh_archive()
 
     def _archive_rename_tag(self, tree: QTreeWidget, tag: str) -> None:
         """Wrap on_rename_tag with a post-rename tree refresh so the
         archive immediately reflects the renamed tag and any merged
         rows. The handler itself doesn't know about the tree."""
         self.on_rename_tag(old_tag=tag)
-        self._populate_archive_tree(tree)
+        self._refresh_archive()
 
     def _archive_rename(self, tree: QTreeWidget, session_name: str) -> None:
         new_name, ok = QInputDialog.getText(
@@ -2384,7 +2540,7 @@ class App:
         )
         if ok and new_name.strip() and new_name.strip() != session_name:
             storage.rename_session(session_name, new_name.strip())
-            self._populate_archive_tree(tree)
+            self._refresh_archive()
 
     def _archive_retag(self, tree: QTreeWidget, session_name: str) -> None:
         """Switch the tag of one session. Picker shows existing tags
@@ -2412,7 +2568,7 @@ class App:
         if ok and new_tag and new_tag != current:
             storage.retag_session(session_name, new_tag)
             self._refresh_carry_from_storage()
-            self._populate_archive_tree(tree)
+            self._refresh_archive()
 
     def _archive_delete(self, tree: QTreeWidget, session_name: str) -> None:
         reply = QMessageBox.question(
@@ -2423,7 +2579,7 @@ class App:
         if reply == QMessageBox.Yes:
             storage.delete_session(session_name)
             self._refresh_carry_from_storage()
-            self._populate_archive_tree(tree)
+            self._refresh_archive()
 
     def _archive_retime(self, tree: QTreeWidget, session_name: str) -> None:
         """Change the recorded time on a specific session row.
@@ -2458,7 +2614,7 @@ class App:
             session_name=target.session_name,
         )
         self._refresh_carry_from_storage()
-        self._populate_archive_tree(tree)
+        self._refresh_archive()
 
     # ---- Idle / sleep handlers ------------------------------------------
 
