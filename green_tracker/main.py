@@ -667,12 +667,14 @@ class App:
             recent_tags=lambda: self.config.get("recent_tags", []),
             current_tag=lambda: self.tracker.tag,
             has_active_session=self._has_active_session,
+            can_undo=storage.can_undo,
             is_running=lambda: self.tracker.state == State.RUNNING,
             save_session=self.on_save_session,
             new_session=self.on_new_session,
             set_tag=self.on_set_tag,
             switch_tag=self.on_switch_tag,
             new_tag=self.on_new_tag,
+            undo=self.on_undo,
             prompt_new_tag=self.on_prompt_new_tag,
             rename_tag=self.on_rename_tag,
             add_record=self.on_add_record,
@@ -1429,6 +1431,29 @@ class App:
         self.on_set_tag(tag)
         self._session_started = True
         self._update_running_state()
+
+    def on_undo(self) -> None:
+        """Undo the last CSV mutation (spec §5).
+
+        Pops the newest whole-file snapshot and writes it back through the
+        same crash-safe path as a normal save. The stack is global and
+        in-process, so this undoes the last mutation from any surface —
+        a widget save, a tag switch's auto-save, an archive edit, a web
+        editor save — not merely the last one made from this menu.
+
+        Re-seeds the carry afterwards for the same reason
+        _write_rows_for_web does: the restored CSV may hold a different
+        total for the live (tag, today) row than the one on screen, and
+        without this the widget would keep displaying the pre-undo
+        figure until the next state change.
+
+        The tracker itself is untouched. Undo restores *stored* history;
+        it is not a time machine for the session on the clock, and
+        rewinding a running session would be a surprise nobody asked for.
+        """
+        if not storage.undo():
+            return  # nothing on the stack; the menu item is greyed anyway
+        self._refresh_carry_from_storage()
 
     def on_new_tag(self) -> None:
         """"New tag…" in the picker: free-text entry, then switch to it.
