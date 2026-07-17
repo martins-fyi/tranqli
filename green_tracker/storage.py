@@ -624,10 +624,13 @@ def rename_tag(old_tag: str, new_tag: str) -> bool:
 # have no version field at all (treated as v1).
 CURRENT_CONFIG_VERSION = 3
 
-# Cap for the recent_tags MRU list. The Tags menu only ever displays 5,
-# but we keep more than we show so the "More..." surface has history to
-# draw on without a second store.
+# Cap for the recent_tags MRU list — what we retain.
 RECENT_TAGS_MAX = 20
+
+# How many of them a picker offers — what we show. Deliberately smaller
+# than what we keep, so the pickers stay short while More... and the
+# archive still have history behind them (spec §1).
+RECENT_TAGS_SHOWN = 5
 
 # Migration map for the widget_size rename. The four-tier scheme
 # (mini / small / medium / large = 13 / 22 / 48 / 64 px) was collapsed

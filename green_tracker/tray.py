@@ -52,11 +52,6 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from .widget import COLOR_SCHEMES, make_scheme_icon
 
-# How many of the MRU's tags the Switch task picker shows (spec §3).
-# Storage retains RECENT_TAGS_MAX (20) — deliberately more than this, so
-# the picker stays short while More… still has history behind it.
-_RECENT_TAGS_SHOWN = 5
-
 
 # Tray icon — colours are 25% brighter than the widget's running/paused
 # backgrounds so the tiny dot reads clearly against the system tray, while
@@ -81,7 +76,7 @@ class MenuContext:
     current_shape:      Callable[[], str]            # "rect"  | "circle"
     elapsed_seconds:    Callable[[], float]          # tracker's live elapsed
     tag_lifetimes:      Callable[[], Mapping[str, str]]  # tag -> "02d 02h"
-    recent_tags:        Callable[[], Sequence[str]]  # MRU order, most-recent first
+    recent_tags:        Callable[[], Sequence[str]]  # already capped; most-recent first
     current_tag:        Callable[[], Optional[str]]  # active tag, None if no session
     has_active_session: Callable[[], bool]           # gates Save / Retag session
     is_running:         Callable[[], bool]           # drives Save vs Stop&Save label
@@ -174,7 +169,7 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     # buries them among every tag ever created. Storage keeps more than
     # this (RECENT_TAGS_MAX) so More… has history to draw on.
     switch_menu = tags_root.addMenu("Switch Tags")
-    recent = list(ctx.recent_tags())[:_RECENT_TAGS_SHOWN]
+    recent = list(ctx.recent_tags())
     if recent:
         # Exclusive group so the checkmark reads as "this is the one
         # you're on", matching the Size and Color schemes menus below.

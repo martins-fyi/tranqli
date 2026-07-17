@@ -86,6 +86,14 @@ def _format_short(seconds: float) -> str:
     return f"{secs // 3600:02d}"
 
 
+# The "name a new tag" row in the launch gate's picker (§2a). Matched by
+# value, since QInputDialog.getItem hands back the chosen string rather
+# than its index — so a tag named exactly this would shadow the row. The
+# ellipsis makes that about as unlikely as it gets without hand-rolling
+# the dialog, and the cost if it ever happened is one extra prompt.
+_NEW_TAG_ITEM = "New tag…"
+
+
 def _seconds_to_minutes(seconds: float) -> int:
     """Round seconds to whole minutes, half rounds up (brief §10).
 
@@ -663,8 +671,12 @@ class App:
             tag_lifetimes=self._get_tag_lifetimes,
             # Read from config on each menu build rather than captured
             # once — the MRU reorders on every switch, and a stale list
-            # would show the wrong five in the wrong order.
-            recent_tags=lambda: self.config.get("recent_tags", []),
+            # would show the wrong five in the wrong order. Capped here
+            # rather than in tray.py so how-many-to-show stays one
+            # decision, shared with the launch gate's picker.
+            recent_tags=lambda: self.config.get(
+                "recent_tags", [],
+            )[:storage.RECENT_TAGS_SHOWN],
             current_tag=lambda: self.tracker.tag,
             has_active_session=self._has_active_session,
             can_undo=storage.can_undo,
@@ -1145,35 +1157,62 @@ class App:
         self.tracker.toggle()
         self._update_running_state()
 
-    def _pick_session_tag(self) -> Optional[str]:
-        """Tag picker shown when starting a new session.
+    def _prompt_new_tag_text(self, first_ever: bool = False) -> Optional[str]:
+        """Ask for a new tag's name. None if cancelled or left blank.
 
-        - If tags exist: read-only picker, pre-selected to last_tag.
-        - If no tags exist: free-form entry (fresh-user case — new tags
-          should otherwise be added via the web editor).
+        The single place a tag gets named, shared by the launch gate and
+        the menu's New Tag\u2026, so both surfaces create tags identically
+        rather than drifting into two dialogs with two behaviours.
         """
-        existing = sorted(storage.tag_totals().keys())
-        last = (self.config.get("last_tag") or "").strip()
+        text, ok = QInputDialog.getText(
+            self.widget,
+            "First tag" if first_ever else "New tag",
+            "No tags yet \u2014 name your first one:"
+            if first_ever else "Tag name:",
+        )
+        if not ok:
+            return None
+        return text.strip() or None
 
-        if not existing:
-            # First-ever run — let them seed a single tag here. After that,
-            # new tags only via the web editor.
-            text, ok = QInputDialog.getText(
-                self.widget, "First tag",
-                "No tags yet. Enter your first tag\n"
-                "(future tags should be added via Edit data (web)\u2026):",
-                text=last,
-            )
-            text = text.strip() if ok else ""
-            return text or None
+    def _pick_session_tag(self) -> Optional[str]:
+        """The launch gate's picker (\u00a72a): a recent tag, or a new one.
 
-        current_index = existing.index(last) if last in existing else 0
+        Shown before the first left-click of a session may start tracking,
+        offering the same choices as the menu's Switch Tags picker \u2014 the
+        most-recent tags, most-recent first \u2014 plus a row to name a new
+        one.
+
+        That last row is the point of this phase. This previously listed
+        every existing tag alphabetically with no way out, so a returning
+        user who wanted to start something new had to pick a wrong tag and
+        fix it afterwards, or leave and use the web editor. Wanting a new
+        tag is likeliest at exactly this moment: you are about to start
+        work, and the thing you are starting may be new.
+
+        With no history at all there is nothing to pick from, so the list
+        is skipped and the name asked for directly (\u00a72a).
+
+        Returns None if the user backs out, leaving the caller's state
+        untouched.
+        """
+        recent = list(self.config.get("recent_tags", ()))[
+            :storage.RECENT_TAGS_SHOWN
+        ]
+        if not recent:
+            return self._prompt_new_tag_text(first_ever=True)
+
+        # recent[0] is the last-used tag \u2014 push_recent_tag keeps it
+        # there \u2014 so index 0 is already the right default, no lookup.
         chosen, ok = QInputDialog.getItem(
             self.widget, "Start tracking",
             "Which tag are we recording into?",
-            existing, current_index, editable=False,
+            recent + [_NEW_TAG_ITEM], 0, editable=False,
         )
-        return chosen if ok else None
+        if not ok:
+            return None
+        if chosen == _NEW_TAG_ITEM:
+            return self._prompt_new_tag_text()
+        return chosen
 
     def on_widget_menu(self, pos: QPoint) -> None:
         """Widget right-click: show the same menu the tray does."""
@@ -1587,26 +1626,20 @@ class App:
     def on_new_tag(self) -> None:
         """"New tag…" in the picker: free-text entry, then switch to it.
 
-        The only way to create a tag from the widget once tags already
-        exist — _pick_session_tag's free-text branch is reachable only on
-        a first-ever run, and everything else offers existing tags only.
-        Until now the answer was "add it in the web editor", which is a
-        detour when the point is to start working on something new.
+        Creates the tag mid-session, where the launch gate's own New tag…
+        row covers the same need at the start of one. Both go through
+        _prompt_new_tag_text, so a tag is named the same way wherever you
+        happen to be when you decide you need it.
 
         The tag needs no separate registration: tags are implicit, defined
         by whatever strings exist in the CSV's tag column (spec §1), so
         switching to a new name and tracking against it is what brings it
         into being. Nothing is written until the session is saved.
         """
-        text, ok = QInputDialog.getText(
-            self.widget, "New tag", "Tag name:",
-        )
-        if not ok:
+        tag = self._prompt_new_tag_text()
+        if tag is None:
             return
-        text = text.strip()
-        if not text:
-            return
-        self.on_switch_tag(text)
+        self.on_switch_tag(tag)
 
     def on_prompt_new_tag(self) -> None:
         """Prompt to set the tag — delegates to the start-of-session picker.
