@@ -15,6 +15,8 @@ Wiring (in main.py's TrackerApp.__init__):
         read_rows=self._read_rows_for_web,
         write_rows=self._write_rows_for_web,
         rename_tag=self._rename_tag_for_web,
+        undo=self._undo_for_web,        # POST /api/undo
+        can_undo=storage.can_undo,      # GET /api/undo_state
     )
     # bound for the menu callback:
     open_csv_editor = self.csv_editor.open_in_browser
@@ -184,6 +186,16 @@ _HTML = r"""<!DOCTYPE html>
     line-height: 1;
   }
   button.delete:hover { background: #f0e0e0; }
+  button.icon-btn {
+    padding: 0.3rem 0.5rem;
+    display: inline-flex;
+    align-items: center;
+  }
+  button.icon-btn img { width: 18px; height: 18px; display: block; }
+  /* Disabled Undo: greyed and non-interactive, clearly distinct from the
+     enabled state (empty stack → nothing to undo). */
+  button.icon-btn:disabled { cursor: default; opacity: 0.35; }
+  button.icon-btn:disabled:hover { background: var(--card-bg); }
   #status {
     margin-left: auto;
     color: var(--text-muted);
@@ -261,6 +273,10 @@ _HTML = r"""<!DOCTYPE html>
   <div class="actions">
     <button onclick="addRow()">+ Add row</button>
     <button class="primary" onclick="saveRows()">Save</button>
+    <button id="undo-btn" class="icon-btn" onclick="undo()"
+            title="Undo" aria-label="Undo" disabled>
+      <img alt="Undo" src="data:image/svg+xml;utf8,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%233a3a3a'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M9%2014L4%209l5-5'/%3E%3Cpath%20d='M4%209h11a5%205%200%200%201%205%205v0a5%205%200%200%201-5%205H9'/%3E%3C/svg%3E">
+    </button>
     <span id="status"></span>
   </div>
 </div>
@@ -323,6 +339,40 @@ async function loadRows() {
     renderRows(rows);
   } catch (e) {
     setStatus('Failed to load', 'error');
+  }
+  updateUndoState();
+}
+
+// Sync the Undo button's disabled state with the shared, in-process undo
+// stack (which the desktop app also feeds), by asking the server — the
+// page can't see the Python stack itself. Called on load and after every
+// mutation, so the button greys the moment there's nothing to undo.
+async function updateUndoState() {
+  const btn = document.getElementById('undo-btn');
+  try {
+    const res = await fetch('/api/undo_state');
+    const data = await res.json();
+    btn.disabled = !data.can_undo;
+  } catch (e) {
+    btn.disabled = true;
+  }
+}
+
+async function undo() {
+  setStatus('Undoing…', '');
+  try {
+    const res = await fetch('/api/undo', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      await loadRows();   // reflect the restored CSV; also refreshes state
+      setStatus(data.undone ? 'Undone' : 'Nothing to undo', 'success');
+      setTimeout(() => setStatus('', ''), 2000);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatus('Error: ' + (err.error || 'undo failed'), 'error');
+    }
+  } catch (e) {
+    setStatus('Network error', 'error');
   }
 }
 
@@ -515,6 +565,7 @@ async function saveRows() {
     });
     if (res.ok) {
       setStatus('Saved', 'success');
+      updateUndoState();   // the save just pushed a snapshot
       setTimeout(() => setStatus('', ''), 2000);
     } else {
       const err = await res.json().catch(() => ({}));
@@ -579,11 +630,19 @@ class CsvEditorServer:
                  read_rows:  Callable[[], List[Dict[str, Any]]],
                  write_rows: Callable[[List[Dict[str, Any]]], None],
                  rename_tag: Optional[Callable[[str, str], bool]] = None,
+                 undo:       Optional[Callable[[], bool]] = None,
+                 can_undo:   Optional[Callable[[], bool]] = None,
                  host: str = HOST,
                  port: int = PORT) -> None:
         self._read_rows  = read_rows
         self._write_rows = write_rows
         self._rename_tag = rename_tag
+        # undo() pops+restores the last CSV snapshot and returns whether it
+        # did; can_undo() reports whether the (shared, in-process) stack is
+        # non-empty, driving the button's disabled state. The Flask page
+        # can't reach the Python stack directly, hence these callbacks (§5).
+        self._undo       = undo
+        self._can_undo   = can_undo
         self._host       = host
         self._port       = port
         self._app:    Optional[Flask]            = None
@@ -683,5 +742,27 @@ class CsvEditorServer:
             except Exception as e:
                 return jsonify({"error": f"rename failed: {e}"}), 500
             return jsonify({"ok": True, "affected": affected})
+
+        @app.route("/api/undo_state", methods=["GET"])
+        def _api_undo_state():
+            """Whether an undo is currently available — drives the Undo
+            button's disabled state. Polled on load and after every
+            mutation, since the stack is shared with the desktop app."""
+            can = bool(self._can_undo()) if self._can_undo is not None else False
+            return jsonify({"can_undo": can})
+
+        @app.route("/api/undo", methods=["POST"])
+        def _api_undo():
+            """Undo the last CSV mutation (§5). Returns whether a snapshot
+            was popped, plus the resulting can_undo so the client can set
+            the button state without a second round-trip."""
+            if self._undo is None:
+                return jsonify({"error": "undo not wired"}), 501
+            try:
+                undone = bool(self._undo())
+            except Exception as e:
+                return jsonify({"error": f"undo failed: {e}"}), 500
+            can = bool(self._can_undo()) if self._can_undo is not None else False
+            return jsonify({"ok": True, "undone": undone, "can_undo": can})
 
         self._app = app

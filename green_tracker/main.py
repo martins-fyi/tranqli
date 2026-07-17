@@ -43,7 +43,8 @@ try:
 except ImportError:
     QAnimationDriver = None  # type: ignore
 from PySide6.QtGui import (
-    QBrush, QColor, QFontDatabase, QGuiApplication, QIcon, QPalette, QPixmap,
+    QBrush, QColor, QFontDatabase, QGuiApplication, QIcon, QPainter,
+    QPalette, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
@@ -199,6 +200,35 @@ def _color_swatch_icon(color: QColor, size: int = 14) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(color)
     return QIcon(pixmap)
+
+
+def _undo_arrow_icon(size: int = 16) -> QIcon:
+    """A counter-clockwise circular arrow — the Undo glyph (spec §5).
+
+    Drawn rather than loaded so there's no asset dependency. Returning a
+    single Normal pixmap lets Qt auto-generate the greyed Disabled variant
+    a QPushButton shows when the button is disabled (empty undo stack)."""
+    from PySide6.QtCore import QRectF   # local: only the archive uses this
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor("#3A3A3A"))
+    pen.setWidthF(max(1.4, size / 10))
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    # ~270° arc, leaving a gap at the top-right where the arrowhead sits.
+    m = size * 0.22
+    rect = QRectF(m, m, size - 2 * m, size - 2 * m)
+    p.drawArc(rect, 90 * 16, 270 * 16)   # start at top, sweep CCW 270°
+    # Arrowhead at the arc's end (top, pointing left → counter-clockwise).
+    cx, cy = size / 2.0, m
+    a = size * 0.18
+    p.drawLine(int(cx), int(cy), int(cx + a), int(cy - a))
+    p.drawLine(int(cx), int(cy), int(cx + a), int(cy + a))
+    p.end()
+    return QIcon(pm)
 
 
 if QAnimationDriver is not None:
@@ -601,6 +631,8 @@ class App:
         self._archive_tabs: Optional[QTabWidget] = None
         # The tab-strip search box, live alongside the tabs above.
         self._archive_search: Optional[QLineEdit] = None
+        # The Archive's Undo button, greyed to mirror the undo stack.
+        self._archive_undo_btn: Optional[QPushButton] = None
 
         # ---- Font --------------------------------------------------------
         self._font_family: Optional[str] = self._load_font()
@@ -767,6 +799,8 @@ class App:
             read_rows=self._read_rows_for_web,
             write_rows=self._write_rows_for_web,
             rename_tag=self._rename_tag_for_web,
+            undo=self._undo_for_web,
+            can_undo=storage.can_undo,
         )
 
         # ---- Wire signals ------------------------------------------------
@@ -1659,6 +1693,25 @@ class App:
             return  # nothing on the stack; the menu item is greyed anyway
         self._refresh_carry_from_storage()
 
+    def _on_archive_undo(self) -> None:
+        """Archive Undo button: undo, then rebuild the open archive.
+
+        Shares on_undo with the menu — same global stack — and follows it
+        with _refresh_archive so the tabs and this button's enabled state
+        reflect the restored CSV immediately.
+        """
+        self.on_undo()
+        self._refresh_archive()
+
+    def _sync_archive_undo_button(self) -> None:
+        """Match the Archive Undo button's enabled state to the stack.
+
+        Called on every archive rebuild, so any mutation (which pushes a
+        snapshot) enables it and an undo that empties the stack greys it.
+        """
+        if self._archive_undo_btn is not None:
+            self._archive_undo_btn.setEnabled(storage.can_undo())
+
     def on_new_tag(self) -> None:
         """"New tag…" in the picker: free-text entry, then switch to it.
 
@@ -1977,6 +2030,7 @@ class App:
         def _on_close(_=0) -> None:
             self._archive_tabs = None
             self._archive_search = None
+            self._archive_undo_btn = None
         dialog.finished.connect(_on_close)
         layout.addWidget(tabs)
 
@@ -2013,6 +2067,19 @@ class App:
         bottom.addWidget(hpd_spin)
 
         bottom.addStretch(1)
+
+        # Undo (spec §5): circular-arrow icon, greyed when the stack is
+        # empty. Same global storage.undo() the menu item uses, so it
+        # reverts the last CSV mutation from any surface. _refresh_archive
+        # rebuilds the tabs and re-syncs this button's enabled state.
+        undo_btn = QPushButton()
+        undo_btn.setIcon(_undo_arrow_icon())
+        undo_btn.setToolTip("Undo")
+        undo_btn.setAccessibleName("Undo")   # alt-text equivalent for Qt
+        undo_btn.setEnabled(storage.can_undo())
+        undo_btn.clicked.connect(self._on_archive_undo)
+        self._archive_undo_btn = undo_btn
+        bottom.addWidget(undo_btn)
 
         close = QPushButton("Close")
         close.clicked.connect(dialog.accept)
@@ -2168,6 +2235,7 @@ class App:
         self._apply_archive_filter()
         tabs.blockSignals(False)
         tabs.setCurrentIndex(select_index)
+        self._sync_archive_undo_button()
 
     def _apply_archive_filter(self) -> None:
         """Hide per-tag tabs whose name doesn't contain the search text.
@@ -2664,6 +2732,21 @@ class App:
         # display stale. Re-seed now so the next paint reflects the
         # saved total.
         self._refresh_carry_from_storage()
+
+    def _undo_for_web(self) -> bool:
+        """Web editor's POST /api/undo: undo the last CSV mutation (§5).
+
+        Same global storage.undo() the menu and Archive button use, so it
+        reverts the most recent change from any surface. Returns whether a
+        snapshot was popped. Re-seeds the carry for the same reason the web
+        write path does — the restored CSV may hold a different total for
+        the live (tag, today) row than the widget is showing. Runs on the
+        Flask thread, matching _write_rows_for_web's existing behaviour.
+        """
+        if not storage.undo():
+            return False
+        self._refresh_carry_from_storage()
+        return True
 
     def _rename_tag_for_web(self, old_tag: str, new_tag: str) -> bool:
         """Web wrapper for storage.rename_tag that also refreshes the
