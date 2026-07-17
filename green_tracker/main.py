@@ -49,8 +49,9 @@ from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QMenu, QMessageBox, QPushButton, QSpinBox,
-    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QStyle, QStyleOptionTab, QStylePainter, QStyledItemDelegate,
+    QSystemTrayIcon, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout,
 )
 
 from . import storage
@@ -457,6 +458,46 @@ class _ArchiveItemDelegate(QStyledItemDelegate):
             painter.setPen(option.palette.base().color())
             painter.drawLine(r.bottomLeft(), r.bottomRight())
         painter.restore()
+
+
+class _AccentTabBar(QTabBar):
+    """Archive tab bar that keeps each tab's label in its own colour.
+
+    setTabTextColor alone is not enough: the native theme draws the
+    SELECTED tab's label in its default text colour, ignoring the per-tab
+    colour, so the current tab went grey while its siblings stayed
+    accented. Painting the label ourselves — the tab shape still by the
+    style — makes the accent hold in every state, selected included.
+
+    Colours still come from the one resolver upstream (via setTabTextColor
+    at build time); this only ensures the stored colour actually renders.
+    """
+
+    def paintEvent(self, _event) -> None:
+        painter = QStylePainter(self)
+        opt = QStyleOptionTab()
+        for i in range(self.count()):
+            self.initStyleOption(opt, i)
+            # Shape (background, border, selected lift) from the style;
+            # the label is blanked here and drawn by hand below.
+            text = opt.text
+            opt.text = ""
+            painter.drawControl(QStyle.CE_TabBarTab, opt)
+            opt.text = text
+
+            color = self.tabTextColor(i)
+            rect = self.tabRect(i)
+            painter.save()
+            painter.setPen(color if color.isValid()
+                           else self.palette().windowText().color())
+            # Elide like the default bar would, and inset so the text
+            # doesn't touch the tab border.
+            inner = rect.adjusted(8, 0, -8, 0)
+            elided = self.fontMetrics().elidedText(
+                text, Qt.ElideRight, inner.width(),
+            )
+            painter.drawText(inner, int(Qt.AlignCenter), elided)
+            painter.restore()
 
 
 def _set_windows_app_user_model_id() -> None:
@@ -1964,6 +2005,9 @@ class App:
         # for the mutation helpers to reach, and cleared when the dialog
         # closes so a stale widget is never repopulated.
         tabs = QTabWidget()
+        # Custom bar so the selected tab keeps its accent text colour
+        # instead of the theme's default (bug: current tab rendered grey).
+        tabs.setTabBar(_AccentTabBar())
         self._archive_tabs = tabs
         # Scroll arrows when the strip overflows the window. Qt scrolls
         # the tab viewport without changing the current tab, which is the
@@ -2061,25 +2105,37 @@ class App:
                 last_seen[s.tag] = s.date
         return sorted(last_seen, key=lambda t: (last_seen[t], t), reverse=True)
 
-    def _archive_tag_accent(self, tag: str) -> QColor:
-        """Accent colour for a tag's tab and its per-tag view.
+    def _tag_color(self, tag: str) -> QColor:
+        """THE resolver for a tag's archive colour. One function, called
+        by every surface that paints a tag — All-tab chips, section and
+        Total rows, the Tags overview, per-tag tab labels (selected and
+        not) and their Total rows. Nothing computes a tag colour any
+        other way; that duplication was what let one tag show two colours.
 
-        Sourced from tag_color_overrides, falling back to the
-        auto-assigned 16-hue archive palette — the same identity the
-        rows carry in the All tab, so a tag looks the same wherever it
-        appears. NOT tag_schemes: that is the widget's colour-scheme
-        selection, a separate system (resolved with the user earlier).
+        A user override in tag_color_overrides wins. Otherwise the tag
+        takes a slot in the 16-hue palette, indexed by one global order —
+        recency of last activity, the same order the tabs use — so the
+        colour never depends on which tab or section is asking, or on a
+        filtered per-tab session list. NOT tag_schemes: that is the
+        widget's colour-scheme system, unrelated (resolved earlier).
 
-        The palette index follows tab order, so it lines up with the
-        first-appearance assignment _populate_archive_tree makes in the
-        newest-first All view.
+        Overridden tags do not consume a palette slot, so adding or
+        clearing one override never reshuffles the other tags' colours.
         """
-        override = self.config.get("tag_color_overrides", {}).get(tag)
+        overrides = self.config.get("tag_color_overrides", {})
+        override = overrides.get(tag)
         if override:
             return QColor(override)
-        order = self._archive_tab_order()
-        idx = order.index(tag) if tag in order else 0
-        return _ARCHIVE_TAG_PALETTE[idx % len(_ARCHIVE_TAG_PALETTE)]
+        idx = 0
+        for t in self._archive_tab_order():
+            if t in overrides:
+                continue  # overrides don't take a palette slot
+            if t == tag:
+                return _ARCHIVE_TAG_PALETTE[idx % len(_ARCHIVE_TAG_PALETTE)]
+            idx += 1
+        # A tag with no stored sessions can't be ordered; fall back to
+        # the first hue rather than raising.
+        return _ARCHIVE_TAG_PALETTE[0]
 
     def _make_archive_tree(self) -> QTreeWidget:
         """Build a wired archive tree — the widget behind every tab.
@@ -2150,7 +2206,7 @@ class App:
 
         select_index = 0
         for tag in self._archive_tab_order():
-            accent = self._archive_tag_accent(tag)
+            accent = self._tag_color(tag)
             tree = self._make_archive_tree()
             self._populate_archive_tree(tree, tag_filter=tag)
             # Lifetime total in the tab label; per-month subtotals live in
@@ -2234,31 +2290,16 @@ class App:
         if self._session_started and self.tracker.tag is not None:
             active_key = (self.tracker.tag, self._today_str())
 
-        # Stable tag → color mapping for the whole view. First-appearance
-        # order in the global newest-first sort, so the most recent tag
-        # gets palette[0], the next-newest unique tag gets palette[1],
-        # and so on. Wraps modulo len(palette) for tag counts beyond the
-        # palette. Same tag has the same color in every section.
-        #
-        # User-set overrides (config["tag_color_overrides"]) take
-        # precedence — clicking "Change color" in the archive context
-        # menu writes here. Overridden tags don't count against the
-        # auto-assign index, so unrelated tags' colors stay stable
-        # when an override is added or removed.
-        overrides = self.config.get("tag_color_overrides", {})
-        tag_colors: Dict[str, QColor] = {}
-        auto_idx = 0
-        for s in ordered:
-            if s.tag in tag_colors:
-                continue
-            override_hex = overrides.get(s.tag)
-            if override_hex:
-                tag_colors[s.tag] = QColor(override_hex)
-            else:
-                tag_colors[s.tag] = _ARCHIVE_TAG_PALETTE[
-                    auto_idx % len(_ARCHIVE_TAG_PALETTE)
-                ]
-                auto_idx += 1
+        # Tag → colour cache for this view, filled entirely from the one
+        # resolver so every section paints from the same source. It used
+        # to be computed inline here with its own palette-index counter,
+        # which is exactly the duplicate that made a tag show one colour
+        # in a chip and another on its tab. Keyed by every tag present so
+        # a per-tag tab's rows resolve against the global order, not the
+        # single-tag filtered list.
+        tag_colors: Dict[str, QColor] = {
+            s.tag: self._tag_color(s.tag) for s in ordered
+        }
 
         # A per-tag tab is a single tag throughout, so the colour chips
         # that distinguish tags in the All view say nothing here.
