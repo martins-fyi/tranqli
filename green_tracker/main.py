@@ -49,9 +49,8 @@ from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QMenu, QMessageBox, QPushButton, QSpinBox,
-    QStyle, QStyleOptionTab, QStylePainter, QStyledItemDelegate,
-    QSystemTrayIcon, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout,
+    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
 from . import storage
@@ -458,46 +457,6 @@ class _ArchiveItemDelegate(QStyledItemDelegate):
             painter.setPen(option.palette.base().color())
             painter.drawLine(r.bottomLeft(), r.bottomRight())
         painter.restore()
-
-
-class _AccentTabBar(QTabBar):
-    """Archive tab bar that keeps each tab's label in its own colour.
-
-    setTabTextColor alone is not enough: the native theme draws the
-    SELECTED tab's label in its default text colour, ignoring the per-tab
-    colour, so the current tab went grey while its siblings stayed
-    accented. Painting the label ourselves — the tab shape still by the
-    style — makes the accent hold in every state, selected included.
-
-    Colours still come from the one resolver upstream (via setTabTextColor
-    at build time); this only ensures the stored colour actually renders.
-    """
-
-    def paintEvent(self, _event) -> None:
-        painter = QStylePainter(self)
-        opt = QStyleOptionTab()
-        for i in range(self.count()):
-            self.initStyleOption(opt, i)
-            # Shape (background, border, selected lift) from the style;
-            # the label is blanked here and drawn by hand below.
-            text = opt.text
-            opt.text = ""
-            painter.drawControl(QStyle.CE_TabBarTab, opt)
-            opt.text = text
-
-            color = self.tabTextColor(i)
-            rect = self.tabRect(i)
-            painter.save()
-            painter.setPen(color if color.isValid()
-                           else self.palette().windowText().color())
-            # Elide like the default bar would, and inset so the text
-            # doesn't touch the tab border.
-            inner = rect.adjusted(8, 0, -8, 0)
-            elided = self.fontMetrics().elidedText(
-                text, Qt.ElideRight, inner.width(),
-            )
-            painter.drawText(inner, int(Qt.AlignCenter), elided)
-            painter.restore()
 
 
 def _set_windows_app_user_model_id() -> None:
@@ -1994,7 +1953,14 @@ class App:
         Delete. Closing the dialog has no side effects — actions
         persist as they happen.
         """
-        dialog = QDialog(self.widget)
+        # Deliberately NOT parented to self.widget. The tracking widget
+        # carries Qt.WindowStaysOnTopHint (brief-addendum §3, widget only),
+        # and on Windows a dialog owned by a topmost window is kept above
+        # everything too — so parenting made the Archive un-coverable even
+        # though it has no topmost flag of its own. As a top-level window
+        # it behaves normally: other windows can cover it, and the widget
+        # stays on top as intended.
+        dialog = QDialog()
         dialog.setWindowTitle("Archive")
         dialog.resize(640, 520)
         layout = QVBoxLayout(dialog)
@@ -2005,9 +1971,6 @@ class App:
         # for the mutation helpers to reach, and cleared when the dialog
         # closes so a stale widget is never repopulated.
         tabs = QTabWidget()
-        # Custom bar so the selected tab keeps its accent text colour
-        # instead of the theme's default (bug: current tab rendered grey).
-        tabs.setTabBar(_AccentTabBar())
         self._archive_tabs = tabs
         # Scroll arrows when the strip overflows the window. Qt scrolls
         # the tab viewport without changing the current tab, which is the
@@ -2206,14 +2169,13 @@ class App:
 
         select_index = 0
         for tag in self._archive_tab_order():
-            accent = self._tag_color(tag)
             tree = self._make_archive_tree()
             self._populate_archive_tree(tree, tag_filter=tag)
-            # Lifetime total in the tab label; per-month subtotals live in
-            # the Year→Month tree (§6b, restored).
+            # Plain default label text — the tag's colour identity lives in
+            # the row backgrounds (like the All tab), not the tab label.
+            # Lifetime total in the label; per-month subtotals in the tree.
             label = f"{tag}   {storage.format_tag_total(totals.get(tag, 0))}"
             index = tabs.addTab(tree, label)
-            tabs.tabBar().setTabTextColor(index, accent)
             if tag == prev_tag:
                 select_index = index
 
@@ -2254,11 +2216,12 @@ class App:
         """Build (or rebuild) the tree contents from current storage state.
 
         With `tag_filter` set (a per-tag tab), only that tag's sessions
-        are shown, and the view drops what would be redundant when every
-        row is the same tag (§6b): no per-row colour chips, no per-section
-        Total rows, and no bottom Tags overview. The lifetime total lives
-        in the tab label instead. With no filter (the All tab) the view is
-        exactly as it was before tabs existed.
+        are shown. Rows carry the tag's background colour just like the
+        All tab; the bottom Tags overview is dropped (a one-row summary of
+        the tab you are already on), and its lifetime total lives in the
+        tab label. Per-month Total rows stay; only the Recent overlay goes
+        subtotal-free. With no filter (the All tab) the view is exactly as
+        it was before tabs existed.
         """
         tree.clear()
         sessions = storage.load_sessions()
@@ -2301,16 +2264,16 @@ class App:
             s.tag: self._tag_color(s.tag) for s in ordered
         }
 
-        # A per-tag tab is a single tag throughout, so the colour chips
-        # that distinguish tags in the All view say nothing here.
-        chips = tag_filter is None
-
-        # Per-month Total rows, though, are NOT redundant with the tab's
-        # single lifetime figure — they show the per-month breakdown that
-        # figure hides — so the Year→Month grouping keeps them in per-tag
-        # tabs too. The Recent overlay does not: a subtotal of the latest
-        # five, sitting right under the header, is the noise §6b meant to
-        # cut, and only the month totals were asked back.
+        # Every row carries its tag's background colour, in both the All
+        # tab and per-tag tabs — a per-tag tab is one solid colour block,
+        # matching how the All tab tints that tag's group. (This reverses
+        # the earlier "no chips in per-tag tabs" call.)
+        #
+        # Total rows: the All tab and per-tag Year→Month groups both keep
+        # their per-month subtotals, which the single lifetime figure
+        # hides. Only the per-tag Recent overlay stays subtotal-free — a
+        # subtotal of the latest five under the header adds nothing.
+        recent_totals = tag_filter is None
 
         # --- Recent (always expanded, no nesting) ---
         if recent:
@@ -2319,7 +2282,7 @@ class App:
             tree.addTopLevelItem(recent_root)
             self._add_tag_groups(
                 recent_root, recent, tag_colors, active_key,
-                show_chips=chips, show_totals=chips,
+                show_chips=True, show_totals=recent_totals,
             )
             recent_root.setExpanded(True)
 
@@ -2354,7 +2317,7 @@ class App:
                 year_item.addChild(month_item)
                 self._add_tag_groups(
                     month_item, months[month], tag_colors, active_key,
-                    show_chips=chips, show_totals=True,
+                    show_chips=True, show_totals=True,
                 )
             # Years collapsed by default — keeps the recent list dominant.
 
