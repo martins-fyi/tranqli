@@ -247,3 +247,40 @@ Local Flask page (`Edit data (web)…`), same in-process undo stack.
   resets on reload.
 - Endpoints: `GET/POST /api/rows`, `POST /api/rename_tag`,
   `GET /api/undo_state`, `POST /api/undo`, `GET /api/tag_colors`.
+
+## 11. Update checking
+
+- **Config schema v4** (`CURRENT_CONFIG_VERSION = 4`): adds an `update_check`
+  block — `last_checked`, `latest_version`, `dismissed_version`,
+  `last_popup_shown`, all `None` by default. Migrated from v3 the same way
+  `recent_tags`/`tag_schemes` were added for v3.
+- **Check mechanics** (`green_tracker/updater.py`): a threaded
+  (`QThread`) GET against the GitHub releases API
+  (`api.github.com/repos/martins-fyi/tranqli/releases/latest`), never the
+  human-facing releases page. This endpoint only returns published,
+  non-draft, non-prerelease releases — so tagging WIP builds as
+  **pre-release** on GitHub keeps them invisible to the check with zero
+  code involved. Fails silently on any network/parse error; retried the
+  next calendar day, never retried same-day.
+- **Two independent throttles**, deliberately decoupled:
+  - The *check itself* runs at most once per calendar day
+    (`should_check_today`), scheduled via `QTimer.singleShot` ~1.5 s after
+    the widget first shows — never blocking first paint or adding to the
+    startup-time TODO.
+  - The *popup* is further throttled to at most once every
+    `POPUP_MIN_INTERVAL_DAYS` (3) days, and never twice for the same
+    version once dismissed (`dismissed_version`). This means multiple
+    releases landing close together can't spam the popup, even if the
+    daily check itself succeeds every time.
+- **The menu item is uncapped.** "Update Available (vX.Y.Z)" sits at the
+  top of the shared right-click menu (widget + tray, §7) whenever a newer
+  version is known, computed fresh on every menu build — it reflects
+  ground truth regardless of whether the popup already fired or was
+  throttled.
+- **Popup dialog**: parentless, non-topmost (same convention as Archive
+  §9 and About — coverable, not pinned above other windows). Skip and
+  Update both call `dismiss()`; Update additionally opens the releases
+  page in the default browser. Neither action touches the stored session
+  data — this is purely a notice, no auto-download or install logic.
+- Not a full auto-updater by design: no install machinery, no dependency
+  on code signing (still open in the backlog). Shipped in **v0.2.1**.
