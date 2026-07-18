@@ -106,6 +106,7 @@ class MenuContext:
     set_color_scheme: Callable[[str], None]
     open_archive:     Callable[[], None]
     open_csv_editor:  Callable[[], None]
+    about:            Callable[[], None]             # About dialog
     minimize_to_tray: Callable[[], None]
     quit_app:         Callable[[], None]
 
@@ -319,7 +320,8 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
 
     menu.addSeparator()
 
-    # --- Tray / Quit ------------------------------------------------------
+    # --- About / Tray / Quit ---------------------------------------------
+    menu.addAction("About", ctx.about)
     menu.addAction("Minimize to tray", ctx.minimize_to_tray)
     menu.addAction("Quit", ctx.quit_app)
 

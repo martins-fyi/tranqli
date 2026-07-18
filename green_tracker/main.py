@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import storage
+from ._version import __version__, __release_date__
 from .tracker import Tracker, State
 from .widget import (
     TrackerWidget, FONT_FILE,
@@ -726,6 +727,7 @@ class App:
             set_color_scheme=self.on_set_color_scheme,
             open_archive=self.on_open_archive,
             open_csv_editor=lambda: self.csv_editor.open_in_browser(),
+            about=self.on_about,
             minimize_to_tray=self.widget.hide,
             quit_app=self.on_quit,
         )
@@ -1979,6 +1981,59 @@ class App:
         storage.save_config(self.config)
 
     # ---- Archive (brief §8) ---------------------------------------------
+
+    def on_about(self) -> None:
+        """Small About dialog: name, version, release date, and links.
+
+        The app's only About surface. Version and release date come from
+        green_tracker._version (the single source the installer also
+        reads), so they can't drift from the release.
+
+        Parentless and non-topmost, like the Archive (§ addendum 3) — a
+        normal, coverable window rather than something pinned above
+        everything by the widget's always-on-top hint.
+        """
+        dialog = QDialog()
+        dialog.setWindowTitle("About Tranqli")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(8)
+
+        name = QLabel("Tranqli")
+        f = name.font()
+        f.setPointSizeF(f.pointSizeF() + 6)
+        f.setBold(True)
+        name.setFont(f)
+        layout.addWidget(name)
+
+        layout.addWidget(QLabel(f"Version {__version__}"))
+        layout.addWidget(QLabel(f"Released {__release_date__}"))
+
+        # Rich-text labels with real hyperlinks. openExternalLinks lets the
+        # OS browser handle the click; the dialog needs no click wiring.
+        site = QLabel(
+            '<a href="https://martins-fyi.github.io/tranqli/">'
+            "martins-fyi.github.io/tranqli</a>"
+        )
+        site.setOpenExternalLinks(True)
+        layout.addWidget(site)
+
+        licence = QLabel(
+            'Developed under the '
+            '<a href="https://opensource.org/license/mit/">MIT License</a>.'
+        )
+        licence.setOpenExternalLinks(True)
+        layout.addWidget(licence)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+        dialog.setFixedSize(dialog.sizeHint())
+        dialog.exec()
 
     def on_open_archive(self) -> None:
         """Grouped archive view: 5 most recent sessions individually at

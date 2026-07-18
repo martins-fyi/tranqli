@@ -8,7 +8,18 @@
 ; ===========================================================================
 
 #define MyAppName        "Tranqli"
-#define MyAppVersion     "0.1.0"
+
+; Single-source the version: parse __version__ from green_tracker\_version.py
+; (line 1 there is exactly  __version__ = "x.y.z"), so the installer and the
+; app's About dialog can never drift. SourcePath is this .iss's directory, so
+; this works regardless of the ISCC working directory.
+#define GetVersion(str FileName) \
+    Local[0] = FileOpen(FileName), \
+    Local[1] = FileRead(Local[0]), \
+    Local[2] = FileClose(Local[0]), \
+    Local[3] = Copy(Local[1], Pos('"', Local[1]) + 1), \
+    Copy(Local[3], 1, Pos('"', Local[3]) - 1)
+#define MyAppVersion     GetVersion(SourcePath + "green_tracker\_version.py")
 #define MyAppPublisher   "martins"
 #define MyAppURL         "https://github.com/martins-fyi/tranqli"
 #define MyAppExeName     "Tranqli.exe"
