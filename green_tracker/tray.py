@@ -81,6 +81,7 @@ class MenuContext:
     has_active_session: Callable[[], bool]           # gates Save / Retag session
     is_running:         Callable[[], bool]           # drives Save vs Stop&Save label
     can_undo:           Callable[[], bool]           # greys the Undo item when empty
+    pending_update:     Callable[[], Optional[str]]  # newer version str, or None
 
     # ---- Action callbacks ------------------------------------------------
     save_session:     Callable[[], None]
@@ -106,6 +107,7 @@ class MenuContext:
     set_color_scheme: Callable[[str], None]
     open_archive:     Callable[[], None]
     open_csv_editor:  Callable[[], None]
+    open_release_page: Callable[[], None]            # opens the GitHub releases page
     about:            Callable[[], None]             # About dialog
     minimize_to_tray: Callable[[], None]
     quit_app:         Callable[[], None]
@@ -122,6 +124,18 @@ def populate_menu(menu: QMenu, ctx: MenuContext) -> None:
     active = ctx.has_active_session()
     running = ctx.is_running()
     tags = ctx.tag_lifetimes()
+
+    # --- Update available (top of the menu, when a newer version is known)
+    # Computed fresh every build, never cached: config can change mid-
+    # session (a background check completing, or the popup's Skip/Update),
+    # and this item must always reflect the current state. Uncapped — it
+    # simply sits here until clicked; only the startup popup is throttled.
+    pending = ctx.pending_update()
+    if pending:
+        menu.addAction(
+            f"Update Available (v{pending})", ctx.open_release_page,
+        )
+        menu.addSeparator()
 
     # --- Save session / Stop & Save --------------------------------------
     # Label flips to "Stop & Save" when actively tracking — makes the

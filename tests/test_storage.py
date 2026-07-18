@@ -479,30 +479,61 @@ class TestConfigMigration:
         monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
         self._write(tmp_path, {"config_version": 2, "widget_size": "small"})
         config = load_config()
-        assert config["config_version"] == 3
+        assert config["config_version"] == CURRENT_CONFIG_VERSION
         assert config["recent_tags"] == []   # no CSV history to seed from
         assert config["tag_schemes"] == {}
+        assert "update_check" in config      # v3->v4 block
         # v2->v3 must not touch size — that remap already ran.
         assert config["widget_size"] == "small"
 
-    def test_v1_cascades_through_both_steps(self, tmp_path, monkeypatch):
+    def test_v1_cascades_to_current(self, tmp_path, monkeypatch):
         # A genuine v1 config on disk: unversioned, pre-remap size.
+        # Must cascade all the way through every step to the current version.
         monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
         self._write(tmp_path, {"widget_size": "medium"})
         config = load_config()
-        assert config["config_version"] == 3
+        assert config["config_version"] == CURRENT_CONFIG_VERSION
         assert config["widget_size"] == "large"   # v1->v2 remap still applies
         assert config["recent_tags"] == []
         assert config["tag_schemes"] == {}
+        assert "update_check" in config
 
     def test_migration_is_persisted(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
         self._write(tmp_path, {"config_version": 2})
         load_config()
         on_disk = json.loads(get_config_path().read_text(encoding="utf-8"))
-        assert on_disk["config_version"] == 3
+        assert on_disk["config_version"] == CURRENT_CONFIG_VERSION
         assert on_disk["recent_tags"] == []
         assert on_disk["tag_schemes"] == {}
+        assert "update_check" in on_disk
+
+    def test_v3_gains_update_check(self, tmp_path, monkeypatch):
+        # v3 config (has recent_tags/tag_schemes, no update_check) -> v4.
+        monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
+        self._write(tmp_path, {
+            "config_version": 3,
+            "recent_tags": ["work"],
+            "tag_schemes": {"work": "earthen"},
+        })
+        config = load_config()
+        assert config["config_version"] == CURRENT_CONFIG_VERSION
+        # existing v3 data preserved
+        assert config["recent_tags"] == ["work"]
+        assert config["tag_schemes"] == {"work": "earthen"}
+        # new block, all fields present and None
+        uc = config["update_check"]
+        assert uc == {
+            "last_checked": None, "latest_version": None,
+            "dismissed_version": None, "last_popup_shown": None,
+        }
+
+    def test_fresh_install_has_update_check(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
+        config = load_config()   # no file -> fresh, stamped at current
+        assert config["config_version"] == CURRENT_CONFIG_VERSION
+        assert "update_check" in config
+        assert config["update_check"]["last_checked"] is None
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TRANQLI_DATA_DIR", str(tmp_path))
@@ -571,7 +602,7 @@ class TestConfigMigration:
         self._write(tmp_path, {"config_version": 2})
         config = load_config()
         assert config["recent_tags"] == []
-        assert config["config_version"] == 3   # bump still happens
+        assert config["config_version"] == CURRENT_CONFIG_VERSION  # bump still happens
 
     def test_fresh_install_seeds_from_csv(self, tmp_path, monkeypatch):
         # No config.json but a real sessions.csv = history, not a new user.

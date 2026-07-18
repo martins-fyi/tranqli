@@ -26,6 +26,7 @@ from __future__ import annotations
 import calendar
 import signal
 import sys
+import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -55,6 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import storage
+from . import updater
 from ._version import __version__, __release_date__
 from .tracker import Tracker, State
 from .widget import (
@@ -706,6 +708,10 @@ class App:
             current_tag=lambda: self.tracker.tag,
             has_active_session=self._has_active_session,
             can_undo=storage.can_undo,
+            # Recomputed live on every menu build — see populate_menu.
+            pending_update=lambda: updater.pending_update(
+                self.config, __version__,
+            ),
             is_running=lambda: self.tracker.state == State.RUNNING,
             save_session=self.on_save_session,
             new_session=self.on_new_session,
@@ -727,6 +733,7 @@ class App:
             set_color_scheme=self.on_set_color_scheme,
             open_archive=self.on_open_archive,
             open_csv_editor=lambda: self.csv_editor.open_in_browser(),
+            open_release_page=self._open_release_page,
             about=self.on_about,
             minimize_to_tray=self.widget.hide,
             quit_app=self.on_quit,
@@ -831,6 +838,12 @@ class App:
         # iteration", which is after the widget gets its first paint.
         if self._pending_crash_recovery is not None:
             QTimer.singleShot(0, self._prompt_crash_recovery_if_needed)
+
+        # Update check — deferred well past first paint so it never delays
+        # startup, and run off-thread (see _run_update_check). Held on the
+        # instance so the QThread isn't garbage-collected mid-run.
+        self._update_worker: Optional[updater.UpdateCheckWorker] = None
+        QTimer.singleShot(1500, self._run_update_check)
 
     # ---- Wiring ---------------------------------------------------------
 
@@ -1979,6 +1992,93 @@ class App:
         self.widget.set_scheme(name)
         self.config["color_scheme"] = name
         storage.save_config(self.config)
+
+    # ---- Update check ---------------------------------------------------
+
+    def _run_update_check(self) -> None:
+        """Deferred startup step (see __init__): check GitHub once a day.
+
+        If we've already checked today, skip the network entirely and just
+        evaluate what we already know. Otherwise spin up the worker thread;
+        the network call never runs on the UI thread.
+        """
+        if not updater.should_check_today(self.config):
+            self._evaluate_update()
+            return
+        worker = updater.UpdateCheckWorker()
+        worker.finished_check.connect(self._on_update_check_finished)
+        self._update_worker = worker  # keep a ref so Qt can't collect it
+        worker.start()
+
+    def _on_update_check_finished(self, latest: object) -> None:
+        """Worker result handler (UI thread). Records the check — stamping
+        today's date whatever the outcome, so a failed/offline check waits
+        until tomorrow — persists, then evaluates."""
+        updater.record_check_result(self.config, latest)
+        storage.save_config(self.config)
+        self._evaluate_update()
+
+    def _evaluate_update(self) -> None:
+        """Act on the known state. The menu item needs no explicit refresh
+        here: populate_menu recomputes pending_update on every open, so it
+        always reflects current config. This only decides the popup, which
+        IS throttled (should_show_popup) independently of the daily check.
+        """
+        latest = updater.pending_update(self.config, __version__)
+        if latest and updater.should_show_popup(self.config, latest):
+            updater.record_popup_shown(self.config)
+            storage.save_config(self.config)
+            self._show_update_popup(latest)
+
+    def _open_release_page(self) -> None:
+        webbrowser.open(updater.GITHUB_RELEASE_URL)
+
+    def _show_update_popup(self, latest: str) -> None:
+        """Interruptive "new version available" popup.
+
+        Parentless and non-topmost like About / Archive (addendum §3, §9) —
+        a normal coverable window. Skip and Update both dismiss `latest`
+        (once acted on, don't re-nag for that version); Update also opens
+        the releases page first.
+        """
+        dialog = QDialog()
+        dialog.setWindowTitle("Update available")
+        dialog.setFixedSize(340, 150)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        msg = QLabel(
+            f"Hello there! There is a new Tranqli version ({latest}) "
+            f"available for you.\n\nWould you like to update?"
+        )
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        skip = QPushButton("Skip")
+        update = QPushButton("Update")
+        update.setDefault(True)
+        buttons.addWidget(skip)
+        buttons.addWidget(update)
+        layout.addLayout(buttons)
+
+        def _dismiss_and_close() -> None:
+            updater.dismiss(self.config, latest)
+            storage.save_config(self.config)
+            dialog.accept()
+
+        def _on_skip() -> None:
+            _dismiss_and_close()
+
+        def _on_update() -> None:
+            self._open_release_page()
+            _dismiss_and_close()
+
+        skip.clicked.connect(_on_skip)
+        update.clicked.connect(_on_update)
+        dialog.exec()
 
     # ---- Archive (brief §8) ---------------------------------------------
 

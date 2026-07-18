@@ -622,7 +622,7 @@ def rename_tag(old_tag: str, new_tag: str) -> bool:
 
 # Bumped whenever the config schema needs migration. Pre-rename configs
 # have no version field at all (treated as v1).
-CURRENT_CONFIG_VERSION = 3
+CURRENT_CONFIG_VERSION = 4
 
 # Cap for the recent_tags MRU list — what we retain.
 RECENT_TAGS_MAX = 20
@@ -644,6 +644,21 @@ _WIDGET_SIZE_MIGRATION_V1_TO_V2 = {
     "medium": "large",
     "large":  "large",
 }
+
+
+def _new_update_check() -> dict:
+    """Default `update_check` block (config v4).
+
+    Tracks the once-daily GitHub release check and the separate popup
+    throttle. All None on a fresh install / migration — the first launch
+    that runs the check fills them in. See green_tracker/updater.py.
+    """
+    return {
+        "last_checked": None,       # ISO date of the last check (any outcome)
+        "latest_version": None,     # newest version seen from GitHub
+        "dismissed_version": None,  # version already shown (Skip or Update)
+        "last_popup_shown": None,   # ISO date the popup last appeared
+    }
 
 
 def _seed_recent_tags() -> list[str]:
@@ -695,6 +710,7 @@ def _new_config() -> dict:
         "config_version": CURRENT_CONFIG_VERSION,
         "recent_tags": _seed_recent_tags(),
         "tag_schemes": {},
+        "update_check": _new_update_check(),
     }
 
 
@@ -724,6 +740,14 @@ def _migrate_config(config: dict) -> tuple[dict, bool]:
             config["recent_tags"] = _seed_recent_tags()
         config.setdefault("tag_schemes", {})
         config["config_version"] = 3
+        changed = True
+
+    if version < 4:
+        # Update-check state (once-daily GitHub release check + popup
+        # throttle). setdefault so a config that somehow already carries
+        # the block keeps its data.
+        config.setdefault("update_check", _new_update_check())
+        config["config_version"] = 4
         changed = True
 
     return config, changed
