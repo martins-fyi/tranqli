@@ -7,10 +7,13 @@ A small frameless always-on-top widget that tracks time against tagged daily tas
 ## What it does
 
 - Always-on-top draggable widget — circle when paused under an hour, rectangle when showing HH:MM
-- One tagged session per day per tag — re-tracking accumulates into the same entry
+- Tracking the same tag on the same day just adds to that day's entry — no duplicates
+- Switch between tags on the fly, retag a session, or rename / delete / merge tags from the menu
+- Undo the last change, up to 8 steps back — from the menu, the archive, or the web page
+- Archive shows all records together or one tab per tag
 - Idle auto-pauses after 3 minutes; sleep gaps discarded
-- Six color schemes; three sizes (small, medium, large)
-- Plain CSV at `%APPDATA%\Tranqli\sessions.csv` — edit in Excel, a text editor, or the bundled local web page (`Edit data (web)` in the right-click menu)
+- Six color schemes; three sizes (small, medium, large); each tag can carry its own scheme
+- Plain CSV at `%APPDATA%\Tranqli\sessions.csv` — edit in Excel, a text editor, or the bundled local web page (`Edit data (web)` in the right-click menu), which can filter by tag
 - Crash-safe writes (write-temp + atomic rename)
 
 ## What it doesn't do
@@ -49,6 +52,7 @@ Output is the `dist\Tranqli\` folder. Move or copy the **whole folder** as a uni
 ## Design docs
 
 - `green-tracker-build-brief.md` — original detailed spec
+- `brief-addendum.md` — the more current of the two: finalized behavior lives here, and where the two disagree, the addendum wins
 
 The internal Python package is still named `green_tracker` — the rename to Tranqli was at the product level, not in source paths.
 
