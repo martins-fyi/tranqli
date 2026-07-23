@@ -8,7 +8,7 @@ Brings together every other module:
     - TrackerWidget    (rounded translucent widget — visuals + interaction)
     - IdleMonitor      (Win32 idle / sleep-gap detection)
     - TrayIcon         (system tray indicator) + shared §7 context menu
-    - CsvEditorServer  (local Flask CSV editor at 127.0.0.1:49377)
+    - CsvEditorServer  (local Flask CSV editor on loopback, port 8377)
 
 Owns the application's runtime state and all cross-module signal routing.
 Individual modules know nothing of each other; main.py is the only place
@@ -44,15 +44,15 @@ try:
 except ImportError:
     QAnimationDriver = None  # type: ignore
 from PySide6.QtGui import (
-    QBrush, QColor, QFontDatabase, QGuiApplication, QIcon, QPainter,
-    QPalette, QPen, QPixmap,
+    QBrush, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QPainter,
+    QPalette, QPen, QPixmap, QRegion,
 )
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QMenu, QMessageBox, QPushButton, QSpinBox,
     QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import storage
@@ -96,6 +96,20 @@ def _format_short(seconds: float) -> str:
 # ellipsis makes that about as unlikely as it gets without hand-rolling
 # the dialog, and the cost if it ever happened is one extra prompt.
 _NEW_TAG_ITEM = "New tag…"
+
+
+# Cadence of the Archive's live "in progress" tab readout (§C), matching
+# the widget's hover-scoped refresh. The readout is minute-resolution, so
+# a 1 s tick is mostly a cheap no-op comparison — it exists so the minute
+# rolls over promptly rather than up to 60 s late. Like the widget's
+# timer, it only runs while it has something to show.
+ARCHIVE_LIVE_REFRESH_MS = 1000
+
+
+# objectName of the lifetime-total header on a per-tag Archive tab. The
+# live tick finds the label by this name instead of caching the widget,
+# which would dangle across the wholesale tab rebuild.
+_ARCHIVE_TAG_TOTAL_NAME = "archive-tag-total"
 
 
 def _seconds_to_minutes(seconds: float) -> int:
@@ -205,31 +219,63 @@ def _color_swatch_icon(color: QColor, size: int = 14) -> QIcon:
     return QIcon(pixmap)
 
 
-def _undo_arrow_icon(size: int = 16) -> QIcon:
-    """A counter-clockwise circular arrow — the Undo glyph (spec §5).
+UNDO_GLYPH = "↩"   # ↩ LEFTWARDS ARROW WITH HOOK — the Undo glyph.
 
-    Drawn rather than loaded so there's no asset dependency. Returning a
-    single Normal pixmap lets Qt auto-generate the greyed Disabled variant
-    a QPushButton shows when the button is disabled (empty undo stack)."""
-    from PySide6.QtCore import QRectF   # local: only the archive uses this
+
+def _undo_arrow_icon(size: int = 16) -> QIcon:
+    """The Undo glyph, ↩ (U+21A9), rendered to an icon (spec §5).
+
+    Painted rather than loaded so there's no asset dependency, and
+    returned as a single Normal pixmap so Qt auto-generates the greyed
+    Disabled variant a QPushButton shows when the button is disabled
+    (empty undo stack).
+
+    This replaced a hand-drawn circular arrow. Size (16 px) and colour
+    (#3A3A3A) are carried over unchanged, so the button's metrics and
+    weight in the bottom bar are unaffected — the swap is visual only.
+    The web editor renders the same character directly in HTML."""
+    # Render oversized, measure the ink, then scale it into place.
+    #
+    # Sizing/centring off font metrics does not work here: QFontMetrics
+    # reports a tight bounding box ~50% taller than ↩'s actual ink in
+    # Segoe UI, which sits the glyph visibly high in the button, and the
+    # error differs per fallback font. Measuring the rendered alpha is
+    # font-independent — it centres and scales whatever glyph the system
+    # actually produced. Cost is one throwaway pixmap per Archive open.
+    scratch_size = size * 4
+    scratch = QPixmap(scratch_size, scratch_size)
+    scratch.fill(Qt.transparent)
+    p = QPainter(scratch)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.TextAntialiasing)
+    p.setPen(QPen(QColor("#3A3A3A")))
+    font = QFont()
+    # Comfortably inside the scratch box so nothing clips before measuring.
+    font.setPixelSize(int(scratch_size * 0.6))
+    p.setFont(font)
+    p.drawText(scratch.rect(), Qt.AlignCenter, UNDO_GLYPH)
+    p.end()
+
+    ink = QRegion(scratch.mask()).boundingRect()
+    if ink.isEmpty():        # glyph missing from every font — nothing to show
+        return QIcon(scratch)
+
+    # 72% of the box on the glyph's longer axis, matching the span of the
+    # circular arc (arrowhead included) this replaced, so the button's
+    # optical weight in the bottom bar is unchanged.
+    glyph = scratch.copy(ink).scaled(
+        QSize(round(size * 0.72), round(size * 0.72)),
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation,
+    )
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(QColor("#3A3A3A"))
-    pen.setWidthF(max(1.4, size / 10))
-    pen.setCapStyle(Qt.RoundCap)
-    p.setPen(pen)
-    p.setBrush(Qt.NoBrush)
-    # ~270° arc, leaving a gap at the top-right where the arrowhead sits.
-    m = size * 0.22
-    rect = QRectF(m, m, size - 2 * m, size - 2 * m)
-    p.drawArc(rect, 90 * 16, 270 * 16)   # start at top, sweep CCW 270°
-    # Arrowhead at the arc's end (top, pointing left → counter-clockwise).
-    cx, cy = size / 2.0, m
-    a = size * 0.18
-    p.drawLine(int(cx), int(cy), int(cx + a), int(cy - a))
-    p.drawLine(int(cx), int(cy), int(cx + a), int(cy + a))
+    p.drawPixmap(
+        round((size - glyph.width()) / 2),
+        round((size - glyph.height()) / 2),
+        glyph,
+    )
     p.end()
     return QIcon(pm)
 
@@ -636,6 +682,18 @@ class App:
         self._archive_search: Optional[QLineEdit] = None
         # The Archive's Undo button, greyed to mirror the undo stack.
         self._archive_undo_btn: Optional[QPushButton] = None
+        # Drives the "in progress" readout on the active tag's own tab
+        # (§C). Scoped deliberately: created with the Archive dialog,
+        # started only while a tag actually holds the live session, and
+        # stopped the moment either condition lapses — so a closed
+        # Archive costs nothing. Mirrors the widget's hover-scoped
+        # refresh, which likewise only ticks while it has something to
+        # show.
+        self._archive_live_timer: Optional[QTimer] = None
+        # Per-tag lifetime totals as of the last tab rebuild. Cached so
+        # the 1 s live tick can recompose a tab label without re-reading
+        # sessions.csv on every tick.
+        self._archive_tab_totals: Dict[str, int] = {}
 
         # ---- Font --------------------------------------------------------
         self._font_family: Optional[str] = self._load_font()
@@ -732,7 +790,7 @@ class App:
             current_scheme=lambda: self._current_scheme,
             set_color_scheme=self.on_set_color_scheme,
             open_archive=self.on_open_archive,
-            open_csv_editor=lambda: self.csv_editor.open_in_browser(),
+            open_csv_editor=self._open_csv_editor,
             open_release_page=self._open_release_page,
             about=self.on_about,
             minimize_to_tray=self.widget.hide,
@@ -931,13 +989,42 @@ class App:
         Defensive clamp on hours-per-day matches the spinbox range
         (1..23) so a corrupt config can't produce nonsense durations.
         """
-        mode = self.config.get("archive_display_mode", "hours")
-        if mode == "workdays":
+        return _format_dhm(minutes, hours_per_day=self._archive_hours_per_day())
+
+    def _archive_hours_per_day(self) -> int:
+        """Hours that count as one "day" for archive duration formatting.
+
+        The single reader of `archive_display_mode` / `archive_hours_per_day`
+        — every archive total goes through here for its divisor, so a
+        surface can't accidentally pick a different one. 24 in the default
+        Hours mode (calendar days); the configured hours-per-day (default
+        8, clamped to the spinbox's 1..23) in Workdays mode.
+        """
+        if self.config.get("archive_display_mode", "hours") == "workdays":
             hpd = int(self.config.get("archive_hours_per_day", 8))
-            hpd = max(1, min(23, hpd))
-        else:
-            hpd = 24
-        return _format_dhm(minutes, hours_per_day=hpd)
+            return max(1, min(23, hpd))
+        return 24
+
+    def _archive_format_tag_total(self, minutes: int) -> str:
+        """A tag's lifetime total, days+hours only, honouring the mode.
+
+        Same truncated "Dd Hh" shape as `storage.format_tag_total` (brief
+        §4 — a coarse lifetime readout, no minutes), but with the archive's
+        day divisor rather than a hardcoded 24 h. This is what the per-tag
+        tab label and the §12c Lifetime header use, so they agree with the
+        Tags overview and the right-click Tags submenu — both of which
+        already honour the divisor via `_archive_format_duration` — in
+        both Hours and Workdays mode. The difference from those two is
+        only resolution: they cascade to minutes, this truncates to hours.
+
+        `storage.format_tag_total` is deliberately NOT reused: it hardcodes
+        1440 min/day, which is exactly the calendar-vs-workday mismatch
+        this replaced (a tag reading "05d 15h" here while the overview two
+        panels away read "16d 07h" for the identical 8109 stored minutes).
+        """
+        day_minutes = self._archive_hours_per_day() * 60
+        m = max(0, int(minutes))
+        return f"{m // day_minutes:02d}d {(m % day_minutes) // 60:02d}h"
 
     def _get_tag_lifetimes(self) -> Dict[str, str]:
         """Return {tag: formatted duration} for the right-click Tags
@@ -1159,6 +1246,11 @@ class App:
                 self._snapshot_timer.stop()
         else:
             self._snapshot_timer.stop()
+        # A session starting or ending changes whether any tab has an
+        # in-progress readout to show. Cheap no-op while the Archive is
+        # closed, which is the common case.
+        self._sync_archive_live_timer()
+        self._tick_archive_live_tab()
 
     # ---- Hour-mark chime -------------------------------------------------
 
@@ -2183,7 +2275,29 @@ class App:
         self._archive_search = search
         tabs.setCornerWidget(search, Qt.TopRightCorner)
 
+        # Right-click a per-tag tab for Delete tag (§B). Bound to the tab
+        # BAR, not the tab widget, so the menu only answers to clicks on
+        # the strip itself and never to a right-click inside a tree.
+        tab_bar = tabs.tabBar()
+        tab_bar.setContextMenuPolicy(Qt.CustomContextMenu)
+        tab_bar.customContextMenuRequested.connect(
+            self._archive_tab_context_menu
+        )
+
+        # Live "in progress" tick for the active tag's tab (§C). Parented
+        # to the dialog so it is destroyed with the window; _sync_archive_
+        # live_timer decides whether it should actually be running.
+        live_timer = QTimer(dialog)
+        live_timer.setInterval(ARCHIVE_LIVE_REFRESH_MS)
+        live_timer.timeout.connect(self._tick_archive_live_tab)
+        self._archive_live_timer = live_timer
+
         def _on_close(_=0) -> None:
+            # Stop before dropping the reference — a timer whose slot
+            # outlives the dialog's tab widget would tick against None.
+            if self._archive_live_timer is not None:
+                self._archive_live_timer.stop()
+            self._archive_live_timer = None
             self._archive_tabs = None
             self._archive_search = None
             self._archive_undo_btn = None
@@ -2345,6 +2459,58 @@ class App:
         )
         return tree
 
+    def _make_tag_tab_page(self, tag: str) -> QWidget:
+        """A per-tag tab's contents: lifetime-total header above the tree.
+
+        Only per-tag tabs get the header. The All tab stays a bare tree —
+        it spans every tag, so there is no single lifetime to total, the
+        same scoping as the live readout (§12c).
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        # Flush with the tab frame; the tree already carries its own
+        # viewport padding, so extra margins here would misalign the
+        # header from the rows it heads.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        header = QLabel(self._archive_tag_total_text(tag))
+        # Looked up by name when the live tick refreshes it, rather than
+        # held in a parallel dict — the tab set is rebuilt wholesale on
+        # every mutation, and a cached widget reference would dangle.
+        header.setObjectName(_ARCHIVE_TAG_TOTAL_NAME)
+        header.setStyleSheet("font-weight: 600; padding: 4px 6px;")
+        layout.addWidget(header)
+
+        tree = self._make_archive_tree()
+        self._populate_archive_tree(tree, tag_filter=tag)
+        layout.addWidget(tree)
+        return page
+
+    def _archive_tag_total_text(self, tag: str) -> str:
+        """The per-tag tab header's text: that tag's lifetime total.
+
+        Formatted by `_archive_format_tag_total` — days+hours only, but
+        with the archive's day divisor — so it agrees with the Tags
+        overview and the right-click Tags submenu (which use the same
+        divisor via `_archive_format_duration`) in both Hours and
+        Workdays mode, and with the tab label, which is now formatted the
+        same way.
+
+        When the tag holds the live session, its unbanked elapsed time is
+        added in, on the same condition that drives the §12c readout. The
+        tracker's elapsed is time not yet written to CSV, so adding it to
+        the stored total counts it once, not twice.
+
+        Note the format is days+hours only, so the displayed value moves
+        on the hour, not every minute; the minute-resolution view of the
+        same in-progress time is the tab label's "● HH:MM".
+        """
+        minutes = self._archive_tab_totals.get(tag, 0)
+        if self._tag_has_live_unsaved_session(tag):
+            minutes += _seconds_to_minutes(self.tracker.elapsed_seconds())
+        return f"Lifetime total: {self._archive_format_tag_total(minutes)}"
+
     def _rebuild_archive_tabs(self) -> None:
         """Rebuild the whole tab set from storage, preserving selection.
 
@@ -2360,9 +2526,11 @@ class App:
         if tabs is None:
             return
 
-        previous = tabs.tabText(tabs.currentIndex()) if tabs.count() else "All"
-        # Strip the " Dd Hh" suffix off a per-tag label to recover the tag.
-        prev_tag = previous.split("   ")[0] if previous != "All" else "All"
+        # The tag each tab stands for is carried in its tabData, not parsed
+        # back out of the label — the label also holds the total and (on the
+        # active tag) a live elapsed readout, none of which belong to the
+        # tag's identity. "All" carries None.
+        prev_tag = tabs.tabBar().tabData(tabs.currentIndex()) if tabs.count() else None
 
         tabs.blockSignals(True)
         while tabs.count():
@@ -2375,16 +2543,14 @@ class App:
         totals: Dict[str, int] = {}
         for s in storage.load_sessions():
             totals[s.tag] = totals.get(s.tag, 0) + s.minutes
+        self._archive_tab_totals = totals
 
         select_index = 0
         for tag in self._archive_tab_order():
-            tree = self._make_archive_tree()
-            self._populate_archive_tree(tree, tag_filter=tag)
-            # Plain default label text — the tag's colour identity lives in
-            # the row backgrounds (like the All tab), not the tab label.
-            # Lifetime total in the label; per-month subtotals in the tree.
-            label = f"{tag}   {storage.format_tag_total(totals.get(tag, 0))}"
-            index = tabs.addTab(tree, label)
+            index = tabs.addTab(
+                self._make_tag_tab_page(tag), self._archive_tab_label(tag),
+            )
+            tabs.tabBar().setTabData(index, tag)
             if tag == prev_tag:
                 select_index = index
 
@@ -2392,6 +2558,135 @@ class App:
         tabs.blockSignals(False)
         tabs.setCurrentIndex(select_index)
         self._sync_archive_undo_button()
+        self._sync_archive_live_timer()
+
+    def _archive_tab_label(self, tag: str) -> str:
+        """Label for a per-tag Archive tab.
+
+        Plain default label text — the tag's colour identity lives in the
+        row backgrounds (like the All tab), not the tab label. Lifetime
+        total in the label; per-month subtotals in the tree.
+
+        The total goes through `_archive_format_tag_total`, so it honours
+        the Hours / Workdays divisor like every other archive total (§12c).
+
+        When this tag holds the widget's active session, a live elapsed
+        readout is appended (§C). It appears only on the tag's own tab —
+        never on "All", which has no single tag to be in progress.
+        """
+        label = f"{tag}   {self._archive_format_tag_total(self._archive_tab_totals.get(tag, 0))}"
+        if self._tag_has_live_unsaved_session(tag):
+            label += f"   ● {self.tracker.elapsed_hhmm()}"
+        return label
+
+    def _sync_archive_live_timer(self) -> None:
+        """Start or stop the live in-progress tick to match current state.
+
+        The timer runs only while BOTH conditions hold: the Archive is
+        open, and some tag currently owns an active session. Called after
+        every tab rebuild and from the tick itself, so the timer shuts
+        itself off as soon as the session is banked, reset, or the tag
+        deleted — it is never a background cost.
+        """
+        timer = self._archive_live_timer
+        if timer is None:
+            return
+        live = (
+            self._archive_tabs is not None
+            and self.tracker.tag is not None
+            and self._tag_has_live_unsaved_session(self.tracker.tag)
+        )
+        if live and not timer.isActive():
+            timer.start()
+        elif not live and timer.isActive():
+            timer.stop()
+
+    def _tick_archive_live_tab(self) -> None:
+        """One live tick: bring every per-tag tab label and header up to date.
+
+        Recomposes each label rather than only the active tag's, so the
+        readout is *removed* when a session is banked or reset — not just
+        added when one starts. Labels and headers are written back only
+        when they actually changed: the readout is minute-resolution (and
+        the header coarser still), so at a 1 s cadence the vast majority
+        of ticks are no-ops and must not churn layout.
+
+        The lifetime-total header rides this same timer rather than owning
+        one — it draws on the same live elapsed time, so a second timer
+        would be redundant and could disagree mid-tick.
+        """
+        tabs = self._archive_tabs
+        if tabs is None:
+            self._sync_archive_live_timer()
+            return
+        bar = tabs.tabBar()
+        for i in range(1, tabs.count()):
+            tag = bar.tabData(i)
+            if not tag:
+                continue
+            label = self._archive_tab_label(tag)
+            if tabs.tabText(i) != label:
+                tabs.setTabText(i, label)
+            self._refresh_tag_total_header(tabs.widget(i), tag)
+        self._sync_archive_live_timer()
+
+    def _refresh_tag_total_header(self, page: Optional[QWidget], tag: str) -> None:
+        """Re-text a per-tag tab's lifetime-total header, if it has one.
+
+        Tolerates a page without the header (the All tab, or a tab built
+        before this existed) rather than assuming the tree is always
+        wrapped — the lookup is by objectName, so a miss is just a no-op.
+        """
+        if page is None:
+            return
+        header = page.findChild(QLabel, _ARCHIVE_TAG_TOTAL_NAME)
+        if header is None:
+            return
+        text = self._archive_tag_total_text(tag)
+        if header.text() != text:
+            header.setText(text)
+
+    def _archive_tab_context_menu(self, pos) -> None:
+        """Right-click menu on a per-tag Archive tab: Delete tag (§B).
+
+        Offered on per-tag tabs only — "All" is the fallback view, not a
+        tag, and has nothing to delete. Delegates wholesale to
+        `on_delete_tag`, the same handler the Tags ▸ menu uses, so the
+        live-session safety check, the confirmation wording, the config
+        cleanup and the tracker reset are all exactly the menu's
+        behaviour rather than a second implementation of it.
+        """
+        tabs = self._archive_tabs
+        if tabs is None:
+            return
+        bar = tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index <= 0:            # -1: no tab under cursor; 0: the All tab
+            return
+        tag = bar.tabData(index)
+        if not tag:
+            return
+
+        menu = QMenu(bar)
+        act = menu.addAction("Delete tag")
+        # Wired through `triggered` rather than comparing exec()'s return
+        # value: exec() only reports the action when the menu was dismissed
+        # by an actual click, so keyboard activation would silently do
+        # nothing. The signal fires however the entry was chosen.
+        act.triggered.connect(lambda _checked=False, t=tag: self._delete_tag_from_tab(t))
+        menu.exec(bar.mapToGlobal(pos))
+
+    def _delete_tag_from_tab(self, tag: str) -> None:
+        """Tab context menu's Delete tag → the shared delete path (§B).
+
+        `on_delete_tag` owns the live-session check, both confirmation
+        dialogs, the storage delete, the config cleanup and the tracker
+        reset. Nothing is re-implemented here; the only addition is the
+        tab-set rebuild, since deleting a tag from the Archive must make
+        its tab disappear. A cancelled confirmation just rebuilds the
+        same tabs — cheap and harmless."""
+        self.on_delete_tag(tag)
+        self._refresh_archive()
 
     def _apply_archive_filter(self) -> None:
         """Hide per-tag tabs whose name doesn't contain the search text.
@@ -2408,7 +2703,11 @@ class App:
             return
         bar = tabs.tabBar()
         for i in range(1, tabs.count()):
-            bar.setTabVisible(i, query in tabs.tabText(i).lower())
+            # Match against the tag itself, not the label — the label also
+            # carries the lifetime total and the live elapsed readout, and
+            # matching those would let "30" surface tags by their minutes.
+            tag = bar.tabData(i) or ""
+            bar.setTabVisible(i, query in str(tag).lower())
 
     def _refresh_archive(self) -> None:
         """Rebuild the archive if it is open; no-op otherwise.
@@ -2876,6 +3175,26 @@ class App:
         self._schedule_hour_chime()
 
     # ---- Webserver bridge -----------------------------------------------
+
+    def _open_csv_editor(self) -> None:
+        """Menu action for "Edit data (web)…".
+
+        The server binds synchronously, so by the time `open_in_browser`
+        returns the socket is already listening — no race between the
+        bind and the browser hitting the URL. If the bind fails outright
+        (every candidate port refused), say so instead of opening a tab
+        that can only show ERR_CONNECTION_REFUSED."""
+        try:
+            self.csv_editor.open_in_browser()
+        except OSError as e:
+            QMessageBox.warning(
+                self.widget,
+                "Tranqli — web editor",
+                "Couldn't start the local web editor.\n\n"
+                f"{e}\n\n"
+                "Your data is unaffected — you can still edit sessions "
+                "from the Archive window.",
+            )
 
     def _read_rows_for_web(self) -> List[Dict[str, Any]]:
         return [r._asdict() for r in storage.load_sessions()]

@@ -284,3 +284,193 @@ Local Flask page (`Edit data (web)…`), same in-process undo stack.
   data — this is purely a notice, no auto-download or install logic.
 - Not a full auto-updater by design: no install machinery, no dependency
   on code signing (still open in the backlog). Shipped in **v0.2.1**.
+
+---
+
+## 12. Web-editor port, tab-bar delete, live readout and totals, undo glyph
+
+Five changes landing after §11, in four areas — §12c covers two. Amends
+§6 (undo surfaces), §8 (delete), §9 (Archive), §10 (web editor).
+
+### 12a. Web editor port: 49377 → 8377
+
+**Symptom**: `Edit data (web)…` opened a browser tab showing
+`ERR_CONNECTION_REFUSED`. No code near the web editor had changed.
+
+**Cause**: 49377 sits in the IANA **ephemeral** range (49152–65535).
+On Windows that range is carved into reserved *exclusion ranges* by
+Hyper-V / WSL / Docker, assigned **dynamically at boot**. A port inside
+one fails to bind with `WinError 10013` ("access forbidden"). So a port
+that worked for months can start refusing after an unrelated reboot,
+with no code change and nothing in the app's history to blame. Confirm
+with `netsh interface ipv4 show excludedportrange protocol=tcp`; a bare
+`bind()` to the port reproduces it in isolation.
+
+**Do not** treat a future recurrence as a regression in the editor. Check
+the exclusion ranges first.
+
+The default is now **8377** — registered range, IANA-unassigned, below
+49152 and so outside anything Windows reserves dynamically.
+
+Two structural fixes alongside the move, since the port alone only
+makes the failure rarer, not visible:
+
+- **Synchronous bind.** Startup went from `app.run()`-in-a-thread to
+  `werkzeug.serving.make_server()` on the calling thread, with only
+  `serve_forever()` handed to the daemon thread. `make_server()` has
+  bound and is listening by the time it returns, so `_ensure_started()`
+  returning *is* the readiness signal — the old race between the bind
+  and `webbrowser.open()` is gone structurally, with no poll or sleep.
+- **Failures surface.** Binding inside the thread meant the `OSError`
+  died with the thread while `_started` was set `True` regardless — so
+  the editor silently no-opped for the rest of the session and the user
+  just saw a dead tab. The bind now raises to the caller, `_started` is
+  only set on success (a later attempt can retry), and `main.py` shows a
+  warning dialog instead of opening a tab that cannot load.
+- **Fallback.** If the preferred port is unavailable, the server rebinds
+  on port 0 (OS-assigned) and `open_in_browser()` reads back
+  `server.server_port`, so the URL always follows the actual bind. A
+  collision is never fatal.
+
+### 12b. "Delete tag" from an Archive tab (amends §8, §9)
+
+Right-clicking a **per-tag** Archive tab offers a single **Delete tag**
+entry. The "All" tab has none — it is the fallback view, not a tag.
+
+**No new delete semantics.** The entry calls the same `on_delete_tag`
+handler as Tag Edit ▸ Delete (§8), so the live-unsaved-session warning,
+both confirmation dialogs, the config cleanup and the tracker reset come
+along unchanged. The only addition is a tab-set rebuild afterwards, so a
+deleted tag's tab disappears. **No separate confirmation was added** —
+`on_delete_tag` already confirms, and a second prompt would double-ask
+and duplicate copy.
+
+The menu is bound to the tab **bar**, not the tab widget, so it never
+answers a right-click inside a tree (which has its own row menu).
+
+The action is wired through `QAction.triggered`, **not** by comparing
+`QMenu.exec()`'s return value. `exec()` only reports an action when the
+menu was dismissed by a mouse click, so the original wiring silently did
+nothing on keyboard selection.
+
+Tabs now carry their tag in `tabData`, not parsed back out of the label
+— the label also holds the lifetime total and the live readout below.
+The tab search box matches `tabData` too, so a query like "30" no longer
+surfaces tags by their minute counts.
+
+### 12c. In-progress readout and lifetime total on a tag's own tab (amends §9)
+
+Two per-tag-tab surfaces, sharing one live-session condition and one
+timer — documented together because that shared plumbing is the point.
+
+**The in-progress readout.** When the widget's session (RUNNING or PAUSED
+with time on the clock) is bound to a tag, **that tag's own tab** appends
+a live elapsed readout:
+
+```
+work   00d 01h   ● 01:23
+```
+
+Never on "All", which has no single tag to be in progress. This is *not*
+a return of the rust in-progress row marker removed in §9 — that painted
+one tag in two colours; this is a text suffix on one tab label and
+touches no colour.
+
+Condition for showing it is `_tag_has_live_unsaved_session` — the same
+predicate delete uses (§8), so "in progress" and "delete would destroy
+live time" can never disagree.
+
+**Refresh is scoped, not background.** A `QTimer` at
+`ARCHIVE_LIVE_REFRESH_MS` (1000 ms, matching the widget's hover-scoped
+`REFRESH_MS`) is parented to the Archive dialog and runs only while
+**both** hold: the Archive is open **and** some tag owns a live session.
+It stops the moment either lapses — session banked, tracker reset, tag
+deleted, or window closed — so a closed Archive costs nothing. The
+readout is minute-resolution, so most ticks are a no-op string compare;
+labels are written back only when actually changed, to avoid churning
+tab-bar layout. Every tick recomposes *all* per-tag labels, so the
+readout is removed when a session ends, not only added when one starts.
+
+**The lifetime-total header.** The same per-tag tab also carries a header
+line in its content area, above the first year/month group:
+
+```
+Lifetime total: 02d 02h
+```
+
+Never on "All" — same scoping as the readout, and for the same reason: a
+tab spanning every tag has no single lifetime to total.
+
+The value comes from `_archive_format_tag_total()` — days+hours only
+(brief §4), but honouring the archive's Hours / Workdays day divisor. So
+it agrees with the tab label (same function) and, up to the minutes they
+truncate, with the Tags overview and the right-click Tags submenu, both
+of which apply that same divisor via `_archive_format_duration`. All four
+archive totals read the same in both modes.
+
+**An earlier version of this got the shared source wrong** — recorded
+here so it isn't reintroduced. The header first used
+`storage.format_tag_total()`, on the stated guarantee that it matched
+"the Tags submenu totals." It did not: `format_tag_total` hardcodes a
+24 h day, whereas the submenu (`_get_tag_lifetimes` →
+`_archive_format_duration`) honours the Workdays toggle. The guarantee
+had been checked against the *tab label* — which used the same 24 h
+function — not the submenu it actually named. Hours mode hid the gap (the
+two divisors coincide there); Workdays mode exposed it, with 8,109 stored
+minutes reading "05d 15h" on the header and label but "16d 07h" in the
+overview and submenu — the same time under two day-length conventions,
+not a data bug. The fix is one divisor-aware formatter shared by all
+four. Same lesson as §12a: a "same source, can't disagree" claim is only
+as strong as the source you actually verified against.
+
+When `_tag_has_live_unsaved_session` holds — the same condition as the
+readout — the tracker's unbanked elapsed time is added in. That elapsed
+is time not yet written to CSV, so adding it counts the in-progress
+session once, not twice.
+
+The header is re-texted inside `_tick_archive_live_tab`, riding the timer
+above rather than owning one: both draw on the same live elapsed time, so
+a second timer would be redundant and could disagree mid-tick. The label
+is located by `objectName` (`_ARCHIVE_TAG_TOTAL_NAME`) rather than cached
+on the instance, because the tab set is rebuilt wholesale on every
+mutation and a stored widget reference would dangle. Non-live changes — a
+save, delete, or merge — reach the header through that rebuild, so they
+land immediately rather than waiting out a tick; this matters because
+with no live session the timer is not running at all.
+
+**The header deliberately does not move minute-by-minute.**
+`_archive_format_tag_total` is days-plus-hours resolution and truncates,
+so a live session only shifts the header on the hour. That is a choice,
+not an oversight: the `● HH:MM` readout above already gives minute
+resolution for the in-progress time, and mirroring it in the header would
+put two live clocks on one tab saying the same thing in two formats —
+while also breaking the header's agreement with the Tags overview and
+submenu, which is the reason it shares their day divisor in the first
+place. Do not "fix" this into a second minute-resolution display.
+
+### 12d. Undo icon → ↩ (amends §6)
+
+Both undo surfaces from §6 now use **↩ (U+21A9, LEFTWARDS ARROW WITH
+HOOK)** in place of the circular arrow. Visual swap only — no change to
+undo behaviour, placement, sizing, or the greyed-when-empty state.
+
+- **Archive**: painted to a `QIcon`, keeping the 16 px box and `#3A3A3A`.
+- **Web editor**: `<span class="undo-glyph">&#x21A9;</span>` replacing the
+  inline-SVG `<img>`, at the same 18 px / `#3a3a3a`, so `:disabled`
+  opacity and the button's metrics are unchanged.
+
+**Sizing must not come from font metrics.** `QFontMetrics.tightBoundingRect`
+over-reports ↩'s height by ~50 % in Segoe UI (40 px reported vs 26 px of
+actual ink), and the error differs per fallback font — centring off it
+sits the glyph visibly high, and a naive "fill the box" multiplier
+overflows the pixmap and clips (at 64 px, the visible ink was a single
+edge column). The icon is therefore rendered oversized to a scratch
+pixmap, its **actual ink bounds measured from the alpha channel**
+(`QRegion(pixmap.mask()).boundingRect()`), then scaled to 72 % of the box
+— the span of the arc it replaced — and centred on those bounds. This is
+font-independent.
+
+Appearance is **not** covered by tests: the offscreen Qt platform used in
+CI substitutes a stub font, so rendered ink there says nothing about the
+real glyph. Tests assert the codepoint and the HTML entity; the visual
+check is manual.
