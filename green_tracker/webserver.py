@@ -67,8 +67,20 @@ if TYPE_CHECKING:
 # Bound to a private port that doesn't collide with the usual development
 # defaults (8000 / 8080 / 5000 / 3000). Loopback-only — never exposed
 # externally.
+#
+# The port deliberately sits BELOW 49152. The old default (49377) fell
+# inside the IANA ephemeral range, which on Windows is carved up into
+# reserved exclusion ranges by Hyper-V / WSL / Docker (see
+# `netsh interface ipv4 show excludedportrange protocol=tcp`). Binding
+# inside such a range fails with WinError 10013 ("access forbidden"),
+# and because those ranges are assigned dynamically at boot, the failure
+# is machine- and reboot-dependent. 8377 is in the registered range,
+# unassigned by IANA, and outside anything Windows reserves.
+#
+# This is only the *preferred* port: `_ensure_started` falls back to an
+# OS-assigned free port if it's taken, so a collision is never fatal.
 HOST = "127.0.0.1"
-PORT = 49377
+PORT = 8377
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -201,7 +213,19 @@ _HTML = r"""<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
   }
-  button.icon-btn img { width: 18px; height: 18px; display: block; }
+  /* ↩ (U+21A9), replacing the former inline-SVG circular arrow. Sized and
+     coloured to match what the <img> occupied (18px box, #3a3a3a) so the
+     button's metrics in the actions row are unchanged — a visual swap
+     only. line-height:1 keeps the glyph from inflating the button height. */
+  button.icon-btn .undo-glyph {
+    width: 18px;
+    height: 18px;
+    display: block;
+    font-size: 18px;
+    line-height: 1;
+    text-align: center;
+    color: #3a3a3a;
+  }
   /* Disabled Undo: greyed and non-interactive, clearly distinct from the
      enabled state (empty stack → nothing to undo). */
   button.icon-btn:disabled { cursor: default; opacity: 0.35; }
@@ -311,7 +335,7 @@ _HTML = r"""<!DOCTYPE html>
     <button class="primary" onclick="saveRows()">Save</button>
     <button id="undo-btn" class="icon-btn" onclick="undo()"
             title="Undo" aria-label="Undo" disabled>
-      <img alt="Undo" src="data:image/svg+xml;utf8,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%233a3a3a'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M9%2014L4%209l5-5'/%3E%3Cpath%20d='M4%209h11a5%205%200%200%201%205%205v0a5%205%200%200%201-5%205H9'/%3E%3C/svg%3E">
+      <span class="undo-glyph" aria-hidden="true">&#x21A9;</span>
     </button>
     <span id="status"></span>
   </div>
@@ -775,6 +799,7 @@ class CsvEditorServer:
         self._port       = port
         self._app:    Optional[Flask]            = None
         self._thread: Optional[threading.Thread] = None
+        self._server                             = None
         self._lock                               = threading.Lock()
         self._started                            = False
 
@@ -782,30 +807,59 @@ class CsvEditorServer:
 
     def open_in_browser(self) -> None:
         """Start the server (idempotent) and launch the editor in the
-        default browser."""
+        default browser.
+
+        Raises OSError if the server can't be bound — the caller is
+        expected to surface that to the user rather than opening a
+        browser tab at a URL that will only ever refuse the connection."""
         self._ensure_started()
         webbrowser.open(f"http://{self._host}:{self._port}/")
 
     # ---- Internal -------------------------------------------------------
 
     def _ensure_started(self) -> None:
-        """Idempotent. If the server's already running, return immediately."""
+        """Idempotent. If the server's already running, return immediately.
+
+        Binds the listening socket SYNCHRONOUSLY (on the calling thread)
+        before handing the server off to a background thread. Two reasons:
+
+        1. Readiness. `app.run()` in a thread binds asynchronously, so the
+           old code raced `webbrowser.open()` against the bind and the
+           browser could hit the URL before anything was listening.
+           `make_server()` has already bound and begun listening by the
+           time it returns, so once `_ensure_started` returns the socket
+           is guaranteed connectable — no polling, no sleep.
+        2. Error visibility. A bind failure inside the thread was silently
+           swallowed (the thread died, `_started` stayed True, and every
+           later attempt no-opped) — the user just saw a dead browser tab.
+           Binding here lets the OSError propagate to the caller."""
         with self._lock:
             if self._started:
                 return
             # Quiet werkzeug — the desktop user doesn't want per-request
             # lines cluttering the console, especially under --windowed.
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
+            from werkzeug.serving import make_server
+
             self._build_app()
+
+            # Preferred port first; if it's occupied or reserved, let the
+            # OS pick any free port (port 0) rather than failing outright.
+            # `open_in_browser` reads back `self._port`, so the URL always
+            # matches whatever we actually bound.
+            try:
+                server = make_server(
+                    self._host, self._port, self._app, threaded=True,
+                )
+            except OSError:
+                server = make_server(
+                    self._host, 0, self._app, threaded=True,
+                )
+            self._port = server.server_port
+
+            self._server = server
             self._thread = threading.Thread(
-                target=self._app.run,
-                kwargs={
-                    "host":         self._host,
-                    "port":         self._port,
-                    "debug":        False,
-                    "use_reloader": False,
-                    "threaded":     True,   # concurrent /api/rows hits OK
-                },
+                target=server.serve_forever,
                 daemon=True,  # dies with the main process; no explicit stop
             )
             self._thread.start()
