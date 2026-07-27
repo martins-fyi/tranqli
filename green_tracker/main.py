@@ -687,6 +687,15 @@ class App:
         # Mutation helpers use it to refresh every tab after an edit; the
         # dialog clears it on close so a stale widget is never touched.
         self._archive_tabs: Optional[QTabWidget] = None
+        # Per-build-pass session cache. _rebuild_archive_tabs seeds this
+        # from one storage.load_sessions() so the pass's many consumers
+        # (tab order, per-tag colours, tree population, totals) share a
+        # single CSV parse instead of each re-reading it — ~1 load per
+        # open instead of one per tag/row. None outside a pass, so nothing
+        # runs against stale data. The derived tab order is memoised
+        # alongside, since _tag_color recomputes it once per tag otherwise.
+        self._archive_pass_sessions: Optional[List[storage.SessionRow]] = None
+        self._archive_pass_tab_order: Optional[List[str]] = None
         # The tab-strip search box, live alongside the tabs above.
         self._archive_search: Optional[QLineEdit] = None
         # The Archive's Undo button, greyed to mirror the undo stack.
@@ -2391,17 +2400,39 @@ class App:
         self._rebuild_archive_tabs()
         dialog.exec()
 
+    def _archive_sessions(self) -> List[storage.SessionRow]:
+        """Sessions for the current Archive build, read once per pass.
+
+        Returns the per-pass cache seeded by _rebuild_archive_tabs when one
+        is active, else a live load. The build path is read-only — it
+        constructs widgets from storage and never writes — so within a
+        single pass the cache can't go stale (mutations happen in separate
+        user-driven events, each of which rebuilds afterwards). Callers
+        outside a pass just get a fresh load, unchanged.
+        """
+        cache = self._archive_pass_sessions
+        return cache if cache is not None else storage.load_sessions()
+
     def _archive_tab_order(self) -> List[str]:
         """Tags for the per-tag tabs, most-recently-active first (§6a).
 
         Recency = the tag's newest session date. Ties broken by name so
         the order is deterministic rather than dependent on CSV order.
+
+        Memoised for the duration of a build pass: _tag_color calls this
+        once per tag, and recomputing the sort each time was part of the
+        per-open cost.
         """
+        if self._archive_pass_tab_order is not None:
+            return self._archive_pass_tab_order
         last_seen: Dict[str, str] = {}
-        for s in storage.load_sessions():
+        for s in self._archive_sessions():
             if s.date > last_seen.get(s.tag, ""):
                 last_seen[s.tag] = s.date
-        return sorted(last_seen, key=lambda t: (last_seen[t], t), reverse=True)
+        order = sorted(last_seen, key=lambda t: (last_seen[t], t), reverse=True)
+        if self._archive_pass_sessions is not None:
+            self._archive_pass_tab_order = order
+        return order
 
     def _tag_color(self, tag: str) -> QColor:
         """THE resolver for a tag's archive colour. One function, called
@@ -2538,39 +2569,50 @@ class App:
         if tabs is None:
             return
 
-        # The tag each tab stands for is carried in its tabData, not parsed
-        # back out of the label — the label also holds the total and (on the
-        # active tag) a live elapsed readout, none of which belong to the
-        # tag's identity. "All" carries None.
-        prev_tag = tabs.tabBar().tabData(tabs.currentIndex()) if tabs.count() else None
+        # Read sessions ONCE for the whole pass. Every consumer below —
+        # _populate_archive_tree (per tab), _tag_color (per tag/row),
+        # _archive_tab_order, the totals loop — draws from this via
+        # _archive_sessions() instead of re-parsing the CSV each time.
+        # Torn down in the finally so no path ever sees stale data.
+        self._archive_pass_sessions = storage.load_sessions()
+        self._archive_pass_tab_order = None
+        try:
+            # The tag each tab stands for is carried in its tabData, not
+            # parsed back out of the label — the label also holds the total
+            # and (on the active tag) a live elapsed readout, none of which
+            # belong to the tag's identity. "All" carries None.
+            prev_tag = tabs.tabBar().tabData(tabs.currentIndex()) if tabs.count() else None
 
-        tabs.blockSignals(True)
-        while tabs.count():
-            tabs.removeTab(0)
+            tabs.blockSignals(True)
+            while tabs.count():
+                tabs.removeTab(0)
 
-        all_tree = self._make_archive_tree()
-        tabs.addTab(all_tree, "All")
-        self._populate_archive_tree(all_tree)
+            all_tree = self._make_archive_tree()
+            tabs.addTab(all_tree, "All")
+            self._populate_archive_tree(all_tree)
 
-        totals: Dict[str, int] = {}
-        for s in storage.load_sessions():
-            totals[s.tag] = totals.get(s.tag, 0) + s.minutes
-        self._archive_tab_totals = totals
+            totals: Dict[str, int] = {}
+            for s in self._archive_sessions():
+                totals[s.tag] = totals.get(s.tag, 0) + s.minutes
+            self._archive_tab_totals = totals
 
-        select_index = 0
-        for tag in self._archive_tab_order():
-            index = tabs.addTab(
-                self._make_tag_tab_page(tag), self._archive_tab_label(tag),
-            )
-            tabs.tabBar().setTabData(index, tag)
-            if tag == prev_tag:
-                select_index = index
+            select_index = 0
+            for tag in self._archive_tab_order():
+                index = tabs.addTab(
+                    self._make_tag_tab_page(tag), self._archive_tab_label(tag),
+                )
+                tabs.tabBar().setTabData(index, tag)
+                if tag == prev_tag:
+                    select_index = index
 
-        self._apply_archive_filter()
-        tabs.blockSignals(False)
-        tabs.setCurrentIndex(select_index)
-        self._sync_archive_undo_button()
-        self._sync_archive_live_timer()
+            self._apply_archive_filter()
+            tabs.blockSignals(False)
+            tabs.setCurrentIndex(select_index)
+            self._sync_archive_undo_button()
+            self._sync_archive_live_timer()
+        finally:
+            self._archive_pass_sessions = None
+            self._archive_pass_tab_order = None
 
     def _archive_tab_label(self, tag: str) -> str:
         """Label for a per-tag Archive tab.
@@ -2745,7 +2787,7 @@ class App:
         it was before tabs existed.
         """
         tree.clear()
-        sessions = storage.load_sessions()
+        sessions = self._archive_sessions()
         if tag_filter is not None:
             sessions = [s for s in sessions if s.tag == tag_filter]
         if not sessions:

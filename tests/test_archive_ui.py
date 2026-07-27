@@ -529,6 +529,63 @@ class TestTagTotalAgreement:
 
 
 # ---------------------------------------------------------------------------
+# Build efficiency — sessions parsed once per open, not once per tag/row
+# ---------------------------------------------------------------------------
+
+class TestArchiveBuildReadsSessionsOnce:
+    """Regression guard for the O(tags) CSV re-parse.
+
+    _tag_color -> _archive_tab_order -> storage.load_sessions used to fire
+    on every per-tag/per-row colour lookup, so one Archive open parsed
+    sessions.csv 80+ times and the count grew with tag count. The build
+    now seeds one per-pass load and every consumer reuses it.
+    """
+
+    def _count_loads_during_open(self, app, monkeypatch, ntags):
+        rows = []
+        for t in range(ntags):
+            for month in ("2026-01", "2026-03", "2026-05"):
+                rows.append(("%s-10" % month, "tag%02d" % t,
+                             "tag%02d-%s" % (t, month), 60 + t))
+        _sessions(*rows)
+
+        real = storage.load_sessions
+        count = {"n": 0}
+
+        def spy(*a, **k):
+            count["n"] += 1
+            return real(*a, **k)
+
+        monkeypatch.setattr(storage, "load_sessions", spy)
+        _open_archive(app, lambda _tabs: None)
+        return count["n"]
+
+    def test_reads_sessions_a_small_bounded_number_of_times(
+        self, app, monkeypatch,
+    ):
+        n = self._count_loads_during_open(app, monkeypatch, ntags=5)
+        # One seed load per pass. A tiny margin is allowed for an
+        # incidental read, but anything approaching one-per-tag (the old
+        # 80+) is the bug returning.
+        assert 1 <= n <= 3, f"expected ~1 load per open, got {n}"
+
+    def test_load_count_does_not_scale_with_tag_count(self, app, monkeypatch):
+        few = self._count_loads_during_open(app, monkeypatch, ntags=2)
+        many = self._count_loads_during_open(app, monkeypatch, ntags=25)
+        assert many == few, (
+            f"load count scales with tags: {few} at 2 tags, {many} at 25"
+        )
+
+    def test_pass_cache_is_torn_down_after_open(self, app):
+        """The cache must not outlive the build — a lingering one would
+        serve stale sessions to a later, independent open."""
+        _sessions(("2026-07-01", "work", "w1", 90))
+        _open_archive(app, lambda _tabs: None)
+        assert app._archive_pass_sessions is None
+        assert app._archive_pass_tab_order is None
+
+
+# ---------------------------------------------------------------------------
 # Timer scoping — the readout must never be a background cost
 # ---------------------------------------------------------------------------
 
