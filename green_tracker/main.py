@@ -222,7 +222,7 @@ def _color_swatch_icon(color: QColor, size: int = 14) -> QIcon:
 UNDO_GLYPH = "↩"   # ↩ LEFTWARDS ARROW WITH HOOK — the Undo glyph.
 
 
-def _undo_arrow_icon(size: int = 16) -> QIcon:
+def _undo_arrow_icon(size: int = 16, family: Optional[str] = None) -> QIcon:
     """The Undo glyph, ↩ (U+21A9), rendered to an icon (spec §5).
 
     Painted rather than loaded so there's no asset dependency, and
@@ -233,14 +233,23 @@ def _undo_arrow_icon(size: int = 16) -> QIcon:
     This replaced a hand-drawn circular arrow. Size (16 px) and colour
     (#3A3A3A) are carried over unchanged, so the button's metrics and
     weight in the bottom bar are unaffected — the swap is visual only.
-    The web editor renders the same character directly in HTML."""
+    The web editor renders the same character directly in HTML.
+
+    `family` MUST be a font that contains U+21A9 — the app passes its
+    bundled Uncut Sans (which does). Drawing the glyph in a font that
+    lacks it forces Qt to enumerate every installed system font on the
+    first draw to find a fallback — a one-time ~950 ms DirectWrite cost
+    that landed on the first Archive open. Naming a font that has the
+    glyph resolves it directly from the application font, no search.
+    Falls back to a bare QFont() when no family is given (e.g. the font
+    asset failed to load) — correct, just slow on first use."""
     # Render oversized, measure the ink, then scale it into place.
     #
     # Sizing/centring off font metrics does not work here: QFontMetrics
     # reports a tight bounding box ~50% taller than ↩'s actual ink in
-    # Segoe UI, which sits the glyph visibly high in the button, and the
-    # error differs per fallback font. Measuring the rendered alpha is
-    # font-independent — it centres and scales whatever glyph the system
+    # Uncut Sans, which sits the glyph visibly high in the button, and the
+    # error differs per font. Measuring the rendered alpha is
+    # font-independent — it centres and scales whatever glyph is
     # actually produced. Cost is one throwaway pixmap per Archive open.
     scratch_size = size * 4
     scratch = QPixmap(scratch_size, scratch_size)
@@ -249,7 +258,7 @@ def _undo_arrow_icon(size: int = 16) -> QIcon:
     p.setRenderHint(QPainter.Antialiasing)
     p.setRenderHint(QPainter.TextAntialiasing)
     p.setPen(QPen(QColor("#3A3A3A")))
-    font = QFont()
+    font = QFont(family) if family else QFont()
     # Comfortably inside the scratch box so nothing clips before measuring.
     font.setPixelSize(int(scratch_size * 0.6))
     p.setFont(font)
@@ -2343,7 +2352,10 @@ class App:
         # reverts the last CSV mutation from any surface. _refresh_archive
         # rebuilds the tabs and re-syncs this button's enabled state.
         undo_btn = QPushButton()
-        undo_btn.setIcon(_undo_arrow_icon())
+        # Pass the bundled Uncut Sans family (which contains U+21A9) so the
+        # glyph resolves from the app font instead of triggering a one-time
+        # ~950 ms system font-fallback search on the first Archive open.
+        undo_btn.setIcon(_undo_arrow_icon(family=self._font_family))
         undo_btn.setToolTip("Undo")
         undo_btn.setAccessibleName("Undo")   # alt-text equivalent for Qt
         undo_btn.setEnabled(storage.can_undo())
