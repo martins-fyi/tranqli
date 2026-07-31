@@ -474,3 +474,87 @@ Appearance is **not** covered by tests: the offscreen Qt platform used in
 CI substitutes a stub font, so rendered ink there says nothing about the
 real glyph. Tests assert the codepoint and the HTML entity; the visual
 check is manual.
+
+---
+
+## 13. Retime session
+
+Lets you directly rewrite a session's recorded duration. Two entry
+points with genuinely different implementations, not two views of the
+same code — documented separately below.
+
+### 13a. What it is
+
+- **Active/in-progress session** — "Retime session" on the widget's
+  right-click menu and the tray icon menu (both route through the same
+  `on_retime_session` handler). Acts on today's currently-tracked
+  session for whichever tag is active.
+- **Any saved past session** — "Retime" on an Archive row's right-click
+  menu (`_archive_retime`). Acts on that specific stored row.
+- Both use the same dialog format as elsewhere in the app: `Xd Xh Xm`.
+- Underlying storage: `storage.set_minutes_for_tag_date()` — a
+  **replace**, not an add, distinct from `commit_session()`'s
+  merge/add semantics. Replacing to zero drops the row, matching the
+  no-row-for-empty-day convention used throughout.
+- Naming: "Retime" (not "Change time") deliberately parallels "Retag,"
+  already established in the Archive.
+- The Archive path is straightforward and was always correct — it
+  prefills from that row's own stored value and edits a static past
+  row with no live-session complication.
+
+### 13b. Active-session Retime — bugs found and fixed (v0.2.3)
+
+The active-session path had three related issues, none of them a code
+regression — this was the feature's original behavior since it was
+first built (July 2026), just not previously exposed clearly:
+
+- **Wrong prefill.** The dialog prefilled from *banked* minutes only
+  (`today_minutes_for_tag`), not the live/unbanked time still accruing
+  in the tracker — so it opened showing `00` (or a stale low number)
+  instead of the session's real current total.
+- **Apparent add-not-replace.** Confirming looked like it added to the
+  old value, because a later Save would merge leftover unbanked time
+  on top of whatever was just entered.
+- **Wrong date on midnight crossing.** A session spanning midnight
+  could target the wrong day entirely, since the tracker's
+  `start_timestamp` could belong to a different calendar day than
+  "today."
+
+**Fix:** prefill now computes today's true total (banked +
+correctly midnight-split live elapsed), writes to today's actual date,
+and adds `Tracker.rebase_day(day, now)` — zeroes unbanked time on or
+after the given day while preserving any portion from *before* it, so
+a straddling session banks its pre-boundary portion instead of losing
+it to a blanket reset.
+
+**A second bug surfaced only through live testing** (there were zero
+tests for Retime before this work): `rebase_day` correctly zeroed the
+tracker, but the crash-recovery snapshot (`active_session.json`)
+wasn't cleared alongside it. A stale snapshot survived to the next
+launch, got re-offered as "unsaved work," and recovering + saving it
+added the old amount on top of the already-banked retimed total — a
+real, reproduced doubling (187 → 374 minutes on a live data row).
+
+Fixed with two layers:
+- `on_retime_session` explicitly clears the snapshot after rebasing,
+  mirroring `on_save_session`'s existing clear for the same reason.
+- `_write_snapshot` now actively clears any existing snapshot when
+  elapsed is zero, rather than merely skipping the write — closing the
+  same hole for any *future* code path that zeroes the tracker without
+  remembering to clear the snapshot itself.
+
+Genuine crash recovery (an actual unclean shutdown) remains correctly
+preserved — verified by a dedicated test alongside the fix.
+
+### 13c. Known gap, deliberately left open
+
+`Tracker.elapsed_seconds()` (the live widget display) is a flat sum,
+not midnight-aware on its own — `get_daily_seconds()` is the only
+midnight-splitting path, and it only runs at save/rollover, per the
+original design (§3). A continuously-running app crossing midnight
+could in theory show a mixed two-day total on the widget face for a
+window of time. In practice this is bounded to roughly the interval of
+the existing always-on rollover timer that detects the date change and
+self-corrects — so real exposure is brief, not persistent. Not fixed
+as part of this work; noted here so it isn't rediscovered from scratch
+later.
