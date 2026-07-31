@@ -150,3 +150,36 @@ class Tracker:
             for d, secs in split_at_midnight(s, e):
                 daily[d] = daily.get(d, 0.0) + secs
         return daily
+
+    def rebase_day(self, day: date, now: datetime | None = None) -> None:
+        """Drop all unbanked time on `day` and after, keeping earlier days.
+
+        Used by Retime: the user has just asserted an authoritative total
+        for `day`, which storage now holds in full. Any tracker time for
+        that day is already inside that number, so leaving it in place
+        would let the next save add it on top a second time.
+
+        Time from BEFORE `day` is deliberately kept. It is unbanked work
+        that Retime said nothing about — it belongs to an earlier date's
+        row, so a blanket reset() would silently destroy it. An interval
+        straddling the boundary is truncated at midnight rather than
+        dropped whole, and a running stretch that started before `day`
+        banks its pre-midnight portion on the way through.
+
+        The clock keeps running if it was running: `_start` moves to
+        `now`, so future elapsed counts forward from this moment only.
+        """
+        if now is None:
+            now = datetime.now()
+        boundary = datetime.combine(day, time.min)
+        kept: list[tuple[datetime, datetime]] = []
+        for s, e in self._intervals:
+            if e <= boundary:
+                kept.append((s, e))
+            elif s < boundary:
+                kept.append((s, boundary))
+        if self._start is not None:
+            if self._start < boundary:
+                kept.append((self._start, boundary))
+            self._start = now
+        self._intervals = kept

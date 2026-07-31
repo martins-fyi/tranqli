@@ -32,29 +32,8 @@ from green_tracker import main as M, storage  # noqa: E402
 IN_PROGRESS_MARK = "●"
 
 
-@pytest.fixture(scope="session")
-def app(tmp_path_factory):
-    """The one App instance for the session (QApplication is per-process).
-
-    The data dir MUST be redirected here, before construction. Session
-    fixtures resolve ahead of function-scoped autouse ones, so conftest's
-    `isolate_data_dir` has not run yet at this point — without the
-    redirect below, `App()` reads the developer's real data directory,
-    finds their genuine crash-recovery snapshot, and blocks the suite on a
-    modal "Recover unsaved session?" prompt whose Discard button would
-    destroy real tracked time. The overrides mirror conftest's, and are
-    unwound once construction is done: from then on the per-test fixture
-    owns isolation, and `storage.get_data_dir()` resolves per call, so
-    each test's Archive rebuild reads that test's own sessions.
-    """
-    with pytest.MonkeyPatch.context() as mp:
-        data = tmp_path_factory.mktemp("app-data")
-        mp.setenv("TRANQLI_DATA_DIR", str(data))
-        mp.delenv("TRAENKY_DATA_DIR", raising=False)
-        mp.delenv("APPDATA", raising=False)
-        mp.setattr(Path, "home", classmethod(lambda cls: data / "home"))
-        instance = M.App([])
-    return instance
+# The session-scoped `app` fixture lives in conftest.py — QApplication is
+# per-process, so every Qt test module has to share the one instance.
 
 
 @pytest.fixture(autouse=True)

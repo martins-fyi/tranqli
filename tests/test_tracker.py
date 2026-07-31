@@ -278,3 +278,79 @@ class TestDailySeconds:
 
     def test_empty_session(self):
         assert Tracker().get_daily_seconds() == {}
+
+
+# ---------------------------------------------------------------------------
+# rebase_day — drops one day's unbanked time once Retime has banked it
+# ---------------------------------------------------------------------------
+
+class TestRebaseDay:
+    def test_clears_the_days_own_time(self):
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 31, 9, 0))
+        t.pause(at=datetime(2026, 7, 31, 10, 0))
+        t.rebase_day(date(2026, 7, 31), now=datetime(2026, 7, 31, 10, 0))
+        assert t.get_daily_seconds() == {}
+
+    def test_keeps_earlier_days(self):
+        """Time from before the rebased day is unbanked work belonging to
+        another row — a blanket reset would destroy it."""
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 30, 22, 0))
+        t.pause(at=datetime(2026, 7, 30, 23, 0))        # 1 h on the 30th
+        t.resume(now=datetime(2026, 7, 31, 9, 0))
+        t.pause(at=datetime(2026, 7, 31, 10, 0))        # 1 h on the 31st
+        t.rebase_day(date(2026, 7, 31), now=datetime(2026, 7, 31, 10, 0))
+        assert t.get_daily_seconds() == {
+            date(2026, 7, 30): pytest.approx(3600),
+        }
+
+    def test_truncates_an_interval_straddling_midnight(self):
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 30, 23, 0))
+        t.pause(at=datetime(2026, 7, 31, 1, 0))         # 1 h each side
+        t.rebase_day(date(2026, 7, 31), now=datetime(2026, 7, 31, 1, 0))
+        # The truncated interval ends exactly at midnight, so
+        # split_at_midnight still reports the boundary day — at zero
+        # seconds, which rounds to no row.
+        assert t.get_daily_seconds() == {
+            date(2026, 7, 30): pytest.approx(3600),
+            date(2026, 7, 31): pytest.approx(0),
+        }
+
+    def test_running_stretch_banks_its_pre_midnight_portion(self):
+        """Still running, started yesterday: yesterday keeps its share and
+        the clock restarts at `now`."""
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 30, 23, 0))
+        now = datetime(2026, 7, 31, 1, 0)
+        t.rebase_day(date(2026, 7, 31), now=now)
+        assert t.state is State.RUNNING
+        assert t.get_daily_seconds(now=now) == {
+            date(2026, 7, 30): pytest.approx(3600),
+            date(2026, 7, 31): pytest.approx(0),
+        }
+
+    def test_running_clock_continues_from_now(self):
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 31, 9, 0))
+        now = datetime(2026, 7, 31, 10, 0)
+        t.rebase_day(date(2026, 7, 31), now=now)
+        assert t.elapsed_seconds(now=now) == pytest.approx(0)
+        assert t.elapsed_seconds(
+            now=datetime(2026, 7, 31, 10, 30),
+        ) == pytest.approx(1800)
+
+    def test_paused_session_stays_paused(self):
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 31, 9, 0))
+        t.pause(at=datetime(2026, 7, 31, 10, 0))
+        t.rebase_day(date(2026, 7, 31), now=datetime(2026, 7, 31, 10, 0))
+        assert t.state is State.PAUSED
+
+    def test_keeps_the_tag(self):
+        """Unlike reset(), rebasing is not the end of the session."""
+        t = Tracker()
+        t.start("coding", now=datetime(2026, 7, 31, 9, 0))
+        t.rebase_day(date(2026, 7, 31), now=datetime(2026, 7, 31, 10, 0))
+        assert t.tag == "coding"

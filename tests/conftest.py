@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -57,3 +58,39 @@ def reset_undo_stack():
     storage.clear_undo_stack()
     yield
     storage.clear_undo_stack()
+
+
+@pytest.fixture(scope="session")
+def app(tmp_path_factory):
+    """The one App instance for the session (QApplication is per-process).
+
+    Lives in conftest rather than in a single test module because
+    `App.__init__` constructs its QApplication unconditionally: a second
+    App anywhere in the run would be a second QApplication, which Qt
+    refuses. Any Qt-level test module can depend on this fixture and they
+    all share the instance.
+
+    The data dir MUST be redirected here, before construction. Session
+    fixtures resolve ahead of function-scoped autouse ones, so
+    `isolate_data_dir` has not run yet at this point — without the
+    redirect below, `App()` reads the developer's real data directory,
+    finds their genuine crash-recovery snapshot, and blocks the suite on a
+    modal "Recover unsaved session?" prompt whose Discard button would
+    destroy real tracked time. The overrides mirror `isolate_data_dir`'s,
+    and are unwound once construction is done: from then on the per-test
+    fixture owns isolation, and `storage.get_data_dir()` resolves per
+    call, so each test reads its own sessions.
+    """
+    pytest.importorskip("PySide6")
+    # Must be set before the QApplication is constructed.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from green_tracker import main as M
+
+    with pytest.MonkeyPatch.context() as mp:
+        data = tmp_path_factory.mktemp("app-data")
+        mp.setenv("TRANQLI_DATA_DIR", str(data))
+        mp.delenv("TRAENKY_DATA_DIR", raising=False)
+        mp.delenv("APPDATA", raising=False)
+        mp.setattr(Path, "home", classmethod(lambda cls: data / "home"))
+        instance = M.App([])
+    return instance

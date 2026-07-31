@@ -1084,13 +1084,27 @@ class App:
         (NOT carry — that's a re-lookup-from-storage thing on recovery)
         together with the tag and a date stamp.
 
-        Skipped silently when there's no tag or no elapsed time yet
-        (nothing useful to recover)."""
+        Skipped silently when there's no tag (nothing to attribute
+        recovered time to).
+
+        Zero elapsed CLEARS any existing snapshot rather than merely
+        declining to write one. Skipping used to leave whatever the
+        last tick wrote sitting on disk, which turns any operation
+        that zeroes the tracker into a data-corruption risk: Retime
+        banks today's total to the CSV and rebases the clock, and the
+        stale file then offers that same time back as "unsaved work"
+        on the next launch — where recovery commits it with
+        commit_session, which ADDS. That produced a real doubled row
+        (187 min banked, 187 min recovered, 374 stored). Clearing here
+        makes the invariant "snapshot never outlives the elapsed time
+        it describes" hold for every caller, including future ones
+        that forget to clear explicitly."""
         tag = self.tracker.tag
         if not tag:
             return
         elapsed = int(self.tracker.elapsed_seconds())
         if elapsed <= 0:
+            storage.clear_active_snapshot()
             return
         storage.write_active_snapshot({
             "tag": tag,
@@ -2013,19 +2027,29 @@ class App:
         self._pending_session_name = new_name
 
     def on_retime_session(self) -> None:
-        """Set the recorded time for (active tag, today) outright.
+        """Set today's total for the active tag outright.
 
-        Replaces the storage row's minutes (creating it if absent)
-        — does NOT touch the in-progress tracker. The widget's
-        displayed total = carry (newly-set storage value) + tracker
-        elapsed, so:
+        The dialog opens on today's TRUE total — the minutes already
+        banked in the CSV for (active tag, today) PLUS the portion of
+        the tracker's unbanked elapsed time that actually falls on
+        today. That is the number the widget is showing, so what the
+        user overwrites is what they were looking at.
 
-        - If paused with no elapsed: display shows the new value.
-        - If running with N minutes elapsed: display jumps to
-          new + N (because elapsed continues to count from where
-          it was). On the next save, commit_session will add the
-          elapsed minutes to the new total, keeping the storage
-          value consistent with the display.
+        The split matters when a session started yesterday and ran
+        past midnight: get_daily_seconds() (the same midnight split
+        used by save and by the midnight rollover) attributes only
+        the post-midnight seconds to today, so yesterday's portion is
+        never offered up for editing here.
+
+        On confirm the entered value becomes today's complete,
+        authoritative total: it REPLACES the row (set_minutes_for_tag_
+        date, not commit_session) keyed to today's real calendar date,
+        and the tracker is rebased so today's unbanked time is gone.
+        Without that rebase the next save would add the same elapsed
+        seconds back on top of the number just entered — the "it added
+        instead of replacing" bug. Time tracked before today survives
+        the rebase; it belongs to an earlier row that Retime did not
+        touch.
 
         Empty input cancels. Setting to zero drops the row (matches
         the no-row-for-empty-day invariant)."""
@@ -2035,8 +2059,15 @@ class App:
                 "No active tag yet \u2014 set a tag first.",
             )
             return
-        today = self._today_str()
-        current_mins = storage.today_minutes_for_tag(self.tracker.tag, today)
+        # One `now` for the whole flow: the prefill, the row key and the
+        # rebase must agree on which day "today" is, even if the dialog
+        # happens to sit open across midnight.
+        now = datetime.now()
+        today = now.date()
+        today_str = today.isoformat()
+        banked = storage.today_minutes_for_tag(self.tracker.tag, today_str)
+        live_today = self.tracker.get_daily_seconds(now=now).get(today, 0.0)
+        current_mins = banked + _seconds_to_minutes(live_today)
         new_text, ok = QInputDialog.getText(
             self.widget, "Retime session",
             f"Total time for today's '{self.tracker.tag}' session:",
@@ -2046,9 +2077,16 @@ class App:
             return
         new_mins = _parse_dhm(new_text)
         storage.set_minutes_for_tag_date(
-            self.tracker.tag, today, new_mins,
+            self.tracker.tag, today_str, new_mins,
             session_name=self._pending_session_name,
         )
+        self.tracker.rebase_day(today, now=now)
+        # The crash-safety snapshot still holds the pre-retime elapsed
+        # seconds, which are now inside the CSV total above. Left alone
+        # it would be re-offered as unsaved work on the next launch and
+        # committed with commit_session — which adds, doubling today's
+        # row. Mirrors on_save_session's clear for the same reason.
+        storage.clear_active_snapshot()
         self._refresh_carry_from_storage()
 
     def on_delete_session(self) -> None:
