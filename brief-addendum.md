@@ -491,7 +491,14 @@ same code — documented separately below.
   session for whichever tag is active.
 - **Any saved past session** — "Retime" on an Archive row's right-click
   menu (`_archive_retime`). Acts on that specific stored row.
-- Both use the same dialog format as elsewhere in the app: `Xd Xh Xm`.
+- Since v0.2.4 these are **not** the same dialog, and not the same
+  duration format either — the divergence is deliberate (§13d):
+  - the Archive one is a plain retype-the-value prompt in the app's
+    usual `Dd Hh Mm`, and is the escape hatch for multi-day
+    corrections alongside the web editor;
+  - the active-session one takes `Hh Mm` only — no days, because it
+    edits one (tag, date) row and a row cannot span days — and adds an
+    Add row, quick-add buttons and a 24 h ceiling on accept.
 - Underlying storage: `storage.set_minutes_for_tag_date()` — a
   **replace**, not an add, distinct from `commit_session()`'s
   merge/add semantics. Replacing to zero drops the row, matching the
@@ -558,3 +565,169 @@ the existing always-on rollover timer that detects the date change and
 self-corrects — so real exposure is brief, not persistent. Not fixed
 as part of this work; noted here so it isn't rediscovered from scratch
 later.
+
+### 13d. The Add row, hours-only, and the 24 h ceiling (v0.2.4) — active session only
+
+Retiming used to mean doing the arithmetic yourself: read the running
+total off the dialog, add the twenty minutes you forgot to track, type
+the sum back in. The Add row does that arithmetic for you.
+
+**Layout** (`RetimeSessionDialog`, replacing the plain `QInputDialog`
+that `on_retime_session` used to call):
+
+- **Total** — an `Hh Mm` field, prefilled with today's true total
+  (banked + midnight-split live elapsed) per §13b. Retyping it and
+  pressing OK behaves as it always did.
+- **Add** — a single optional free-text field, empty by default.
+  Enter in it fires the dialog's default button (OK).
+- **+15m / +30m / +1h** — three quick-add buttons under the field.
+
+**No days field, in either input.** A Retime edits exactly one
+(tag, date) row, and a row cannot span days, so a `d` field here is
+meaningless — `1d` is a mistake worth surfacing, not a quantity worth
+parsing. It is gone from the top row (which now formats via
+`_format_hm`, not `_format_dhm`) and from the grammar below. Hours
+simply keep counting: 1500 minutes displays as `25h 00m`, never
+`01d 01h 00m`.
+
+**Deferred fold-in.** The Add field does not touch the Total field as
+you type; the top row keeps showing what is actually stored right up
+to the accept. Only on accept is the sum computed:
+
+    new total = Total field + Add field + (a quick button's amount)
+
+**Apply-and-close buttons.** Clicking a quick button folds in the base
+field, the Add field's text if any, and that button's amount, then
+accepts and closes — one click, done. The buttons do not increment the
+Add field and do not stack; two clicks are impossible because the first
+closes the dialog. They are explicitly not auto-default, so Enter still
+means OK rather than +15m.
+
+**Input grammar** (`_parse_add_delta` — a standalone pure function,
+kept separate from `_parse_dhm` and testable without Qt). Both fields
+share it: the Add field, where the sign carries meaning, and the top
+row, where a total is just an unsigned magnitude. One grammar rather
+than a lenient total and a strict adjustment, so `1d` in the top row is
+refused outright instead of being silently misread as zero.
+
+This table is the canonical record of the accepted input syntax —
+anything the parser rejects is listed below it too, including the cases
+the original brief didn't name. Case-insensitive and whitespace-
+tolerant. A sign is accepted only at the very front: `-` negates the
+whole value, `+` is a no-op that reads the same as no sign at all (the
+quick buttons say "+15m", so typing the plus is the natural thing to
+do).
+
+| Accepted | Reads as |
+| --- | --- |
+| `` (empty) | no delta — not an error |
+| `90` | 90 m — a bare integer is minutes |
+| `-20` | −20 m |
+| `1:30`, `0:45` | 90 m, 45 m — colon notation is H:MM |
+| `-1:30` | −90 m |
+| `45m`, `2h` | 45 m, 120 m |
+| `1h30` | 90 m — a trailing bare number after `h` is minutes |
+| `1h30m`, `1h 30m` | 90 m |
+| `-1h30m` | −90 m |
+| `+30`, `+1:30`, `+1h30m` | 30 m, 90 m, 90 m — identical to the unsigned forms |
+| `25h`, `36h 30m` | 1500 m, 2190 m — hours are uncapped *by the grammar*; see the ceiling below |
+
+Rejected, raising `AddDeltaError`:
+
+- `1d`, `1d2h`, `1d 2h 30m`, `-1d` — days. Not a unit this dialog has;
+  every one of these parsed before the third amendment.
+- `1:75` — minutes ≥ 60 in colon notation. Read as a typo signal, not
+  as 135 minutes; guessing here is how a mistyped entry becomes a
+  silently wrong row.
+- `1:30m` — mixed colon and suffix.
+- `1:2:3` — three colon fields. `D:H:M` went out with the days unit, so
+  this is now just malformed rather than a form to translate. (The
+  legacy `DD:HH:MM` still lives in `_parse_dhm`, which the Archive
+  dialog and the web editor use.)
+- `1.5h` — decimals.
+- `1x`, `abc` — unknown letters.
+- `h`, `m` — a unit with no number.
+- `-`, `+`, `--20`, `++30`, `+-20`, `1h-30`, `1h+30`, `20-` — a sign
+  with no number after it, doubled signs, or a sign anywhere but the
+  very front.
+- `30m 1h` — out-of-order units. A duration reads large-to-small, so
+  each unit must be strictly smaller than the one before it.
+- `1h 2h` — repeated units. Falls out of the same ordering rule.
+- `30m20`, `1 30` — a bare trailing number is minutes only directly
+  after an `h`, and only as the last token. After an `m`, or with no
+  unit before it at all, it's ambiguous rather than shorthand.
+
+The out-of-order, repeated-unit and bare-trailing-number rejections are
+ones the original v0.2.4 brief didn't enumerate; they're recorded here
+because this section, not the brief, is the grammar's canonical record.
+
+Note the deliberate difference from `_parse_dhm`, which returns 0 for
+junk: these fields are *corrections*, so reading unparseable input as
+"no change" — or as zero — would look like the app ignored the user.
+On OK or a quick button with a non-empty, unparseable field the dialog
+does **not** accept; it stays open and shows a short inline error label
+under the Add field. No modal error box.
+
+**Clamped at zero, and zero drops the row.** The folded result is
+converted to minutes and clamped to a minimum of 0, so subtracting more
+than the day holds empties it rather than going negative. Because the
+write is still `storage.set_minutes_for_tag_date()`, landing on 0 drops
+the row entirely — the same no-row-for-empty-day convention as typing
+`0m` by hand. Overflow normalises for free, since everything is summed
+in minutes: 50m + 30m stores 80, which `_format_hm` renders `01h 20m`.
+
+**24 h ceiling, refused on accept.** A Retime can only run against a
+day in progress, so a total above 24 h is a typo rather than data. On
+OK or a quick button, a folded result over `RetimeSessionDialog.
+MAX_MINUTES` (1440) does not accept: the dialog stays open and the same
+inline label reads `24h limit exceeded`. Specifics that matter:
+
+- **Exactly 1440 is allowed.** Only strictly greater is refused; 24 h
+  is a legal day.
+- **Refused, not clamped** — deliberately asymmetric with the
+  clamp-at-0 above. Zero is a meaningful total (it drops the row);
+  1441 is not a meaningful total, so silently rewriting it to 1440
+  would be inventing a number the user didn't ask for.
+- **Checked on the folded total**, not on either field alone. `+8h`
+  is fine by itself and refused on top of `20h`, and a quick button can
+  trip it (23h50m + `+15m`).
+- **Not a grammar rule.** `_parse_add_delta` still parses any
+  magnitude — `25h` is a perfectly good parse. The ceiling is
+  accept-time validation on the result, which is what lets the two
+  concerns be tested separately.
+- **The prefill is exempt.** Rows over 1440 already exist — the web
+  editor and the Archive dialog can both write one, and this dialog
+  accepted them before this change. So it opens on such a row and
+  renders it (`33h 20m` for 2000 minutes); only the accept is refused,
+  leaving the user free to reduce it and confirm. Refusing to *load*
+  would make the one tool for fixing a bad number the one tool that
+  won't open on it.
+
+**It is not a new write path.** The dialog only produces a different
+number; `on_retime_session` then does exactly what §13b established —
+`set_minutes_for_tag_date` to *today's* real date, `Tracker.rebase_day`,
+and an explicit `storage.clear_active_snapshot()`. An add-then-confirm
+that skipped that clear would reintroduce the 187 → 374 doubling, so
+the regression is pinned by tests on both the OK and quick-button
+routes, alongside one proving a genuine crash after an add is still
+recoverable.
+
+**None of this went into the Archive dialog, deliberately.** The
+Archive row's Retime (`_archive_retime`) stays a plain
+retype-the-value prompt in `Dd Hh Mm`, with no Add row, no quick
+buttons and no ceiling. Two separate reasons, both intentional:
+
+- **No Add row.** It exists because a *live* session's total is a
+  moving number you are correcting mid-flight; a finished past row is
+  a static value you are simply restating, and quick-add buttons there
+  would invite nudging history a quarter-hour at a time.
+- **Days and over-24h values stay reachable there.** The Archive
+  dialog is the escape hatch — alongside the web editor — for
+  correcting a row that legitimately needs `d`, or for repairing one
+  that already exceeds a day. Removing days and capping at 24 h
+  everywhere would have left no in-app way to fix such a row.
+
+So the two dialogs now differ in units (`Hh Mm` vs `Dd Hh Mm`), in
+having an Add row, and in enforcing a ceiling. That divergence is a
+decision, not drift: §13a records it, and it should not be quietly
+"reconciled" later by making the two match again.
