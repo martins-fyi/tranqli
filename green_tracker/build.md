@@ -1,8 +1,7 @@
 # Build
 
-```
-pyinstaller --onefile --windowed --add-data "assets;assets" main.py
-```
+Build instructions live in [`../build.md`](../build.md) — one document,
+covering the PyInstaller bundle and the Inno Setup installer.
 
-Output: `dist/main.exe` (~40–70 MB with Qt bundled).
-Rename to `Tranqli.exe` before distributing.
+This file is kept only so links to it don't dead-end. Don't add build
+steps here; they will drift.
