@@ -1,5 +1,5 @@
-__version__ = "0.2.3"
-__release_date__ = "2026-07-31"
+__version__ = "0.2.4"
+__release_date__ = "2026-08-08"
 
 # Single source of truth for the app version and release date.
 #

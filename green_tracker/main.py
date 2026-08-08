@@ -24,6 +24,7 @@ For PyInstaller packaging, this file is the entry point — see build.md.
 from __future__ import annotations
 
 import calendar
+import re
 import signal
 import sys
 import webbrowser
@@ -164,6 +165,33 @@ def _format_dhm(minutes: int, hours_per_day: int = 24) -> str:
     return f"{mins:02d}m"
 
 
+def _format_hm(minutes: int) -> str:
+    """Format minutes as `Xh Xm` — like _format_dhm but with no days
+    bucket, so hours simply keep counting up.
+
+    Used by the active-session Retime dialog, which edits exactly one
+    (tag, date) row: a single calendar day can't hold a `d` field, so
+    offering one there is meaningless (addendum §13d). The Archive's
+    row Retime keeps _format_dhm.
+
+        0    -> "00m"
+        45   -> "45m"
+        90   -> "01h 30m"
+        1440 -> "24h 00m"
+        1500 -> "25h 00m"
+
+    Values above 24 h are formatted, not rejected: rows over a day
+    already exist (the web editor and Archive can write them) and the
+    dialog has to be able to open on one in order to fix it. The 24 h
+    ceiling is enforced on accept, not on display.
+    """
+    m = max(0, int(minutes))
+    h, mins = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}h {mins:02d}m"
+    return f"{mins:02d}m"
+
+
 def _parse_dhm(s: str) -> int:
     """Inverse of _format_dhm. Returns integer minutes.
 
@@ -208,6 +236,173 @@ def _parse_dhm(s: str) -> int:
     if len(nums) == 1:
         return nums[0]
     return 0
+
+
+class AddDeltaError(ValueError):
+    """Raised by _parse_add_delta for input it refuses to guess at.
+
+    Distinct from _parse_dhm's return-0-on-junk behaviour: the Add
+    field is an *adjustment*, so silently reading an unparseable
+    string as "no change" would look like the app ignored the user.
+    The Retime dialog catches this and shows an inline error instead
+    of accepting (addendum §13d).
+    """
+
+
+# Ordering rank for unit suffixes: a duration reads large-to-small, so
+# each unit must be strictly smaller than the one before it. Rejects
+# "30m 1h" and repeats like "1h2h" without needing special cases.
+#
+# There is deliberately no "d". A Retime edits one (tag, date) row and
+# a row cannot span days, so days are meaningless in this dialog —
+# "1d" is a mistake worth surfacing, not a quantity worth parsing
+# (addendum §13d). Multi-day corrections go through the Archive row
+# Retime or the web editor, which both keep the d/h/m format.
+_ADD_UNIT_RANK = {"h": 0, "m": 1}
+_ADD_UNIT_MINUTES = {"h": 60, "m": 1}
+# One number, optional whitespace, optional unit. The unit is optional
+# only so the trailing-minutes form ("1h30") can be caught and checked;
+# a bare number anywhere else is rejected by the loop below.
+_ADD_TOKEN_RE = re.compile(r"(\d+)\s*([hm]?)")
+
+
+def _parse_add_delta(text: str) -> int:
+    """Parse a Retime dialog field to a signed minute count.
+
+    Both of the dialog's fields share this grammar: the Add field,
+    where the sign carries meaning, and the top row, where a total is
+    just an unsigned magnitude. A standalone pure function so the
+    grammar is testable without a Qt event loop. Case-insensitive and
+    whitespace-tolerant. Empty input is 0, not an error. Anything else
+    that doesn't fit raises AddDeltaError — the canonical grammar is
+    documented in brief-addendum.md §13d.
+
+    Hours and minutes only; there is no days unit (see _ADD_UNIT_RANK).
+
+    Accepted:
+        ""          -> 0        (no delta)
+        "90"        -> 90       (bare integer = minutes)
+        "1:30"      -> 90       (colon notation, H:MM)
+        "0:45"      -> 45
+        "45m"       -> 45       (unit-suffixed, h/m in any combo)
+        "2h"        -> 120
+        "25h"       -> 1500     (hours are not capped at 24 here; the
+                    ceiling is an accept-time check, not a grammar rule)
+        "1h30"      -> 90       (trailing bare number after h = minutes)
+        "1h30m"     -> 90
+        "1h 30m"    -> 90
+        "-20", "-1:30", "-1h30m"  -> negated (leading '-' only)
+        "+30", "+1:30", "+1h30m"  -> same as unprefixed ('+' is a
+                    no-op sign, symmetric with '-'; the quick buttons
+                    read "+15m", so typing the plus is natural)
+
+    Rejected (AddDeltaError):
+        "1d", "1d2h"
+                    days — not a unit this dialog has
+        "1:75"      minutes >= 60 in colon notation — a typo signal,
+                    not 135 minutes
+        "1:2:3"     three colon fields; H:MM is the only colon form
+        "1:30m"     mixed colon and suffix
+        "1.5h"      decimals
+        "1x", "h", "1h-30", "1h+30", "+", "30m 1h", "1h 2h", "30m20"
+                    unknown letters, a unit with no number, a sign
+                    anywhere but the front or with no number after it,
+                    out-of-order or repeated units, a bare trailing
+                    number after anything but "h"
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return 0
+    # Non-ASCII digits (e.g. Arabic-Indic) satisfy \d and str.isdigit()
+    # but are never what a user meant to type here; reject up front so
+    # the numeric branches below can trust plain int().
+    if not t.isascii():
+        raise AddDeltaError(f"unrecognised time: {text!r}")
+    # A sign is only ever a prefix, and only one of them: stripping it
+    # here means any further sign character reaches the token loop,
+    # which has no rule for it and rejects ("++30", "1h-30").
+    negative = t.startswith("-")
+    if negative or t.startswith("+"):
+        t = t[1:].strip()
+        if not t:
+            raise AddDeltaError(f"unrecognised time: {text!r}")
+    magnitude = _parse_add_magnitude(t, original=text)
+    return -magnitude if negative else magnitude
+
+
+def _parse_add_magnitude(t: str, original: str) -> int:
+    """The unsigned half of _parse_add_delta. `t` is already stripped,
+    lower-cased and sign-free; `original` is only for the message."""
+    def bad() -> AddDeltaError:
+        return AddDeltaError(f"unrecognised time: {original!r}")
+
+    if ":" in t:
+        # Colon notation is H:MM and nothing else — no suffixes mixed
+        # in, and no third field: D:H:M went out with the days unit,
+        # so "1:2:3" is now just malformed, not a form to translate.
+        parts = t.split(":")
+        if len(parts) != 2:
+            raise bad()
+        hours, mins = (p.strip() for p in parts)
+        if not (hours.isdigit() and mins.isdigit()):
+            raise bad()
+        if int(mins) >= 60:
+            raise bad()
+        return int(hours) * 60 + int(mins)
+    if t.isdigit():
+        return int(t)
+
+    total = 0
+    last_rank = -1
+    prev_unit: Optional[str] = None
+    i = 0
+    while i < len(t):
+        if t[i].isspace():
+            i += 1
+            continue
+        match = _ADD_TOKEN_RE.match(t, i)
+        if not match:
+            raise bad()
+        number, unit = int(match.group(1)), match.group(2)
+        i = match.end()
+        if not unit:
+            # "1h30": a bare number is minutes, but only directly after
+            # an hours field and only as the final token.
+            if prev_unit != "h" or t[i:].strip():
+                raise bad()
+            return total + number
+        rank = _ADD_UNIT_RANK[unit]
+        if rank <= last_rank:
+            raise bad()
+        last_rank = rank
+        total += number * _ADD_UNIT_MINUTES[unit]
+        prev_unit = unit
+    if prev_unit is None:
+        raise bad()
+    return total
+
+
+def _fold_in_minutes(base_text: str, add_text: str, quick: int = 0) -> int:
+    """Combine the Retime dialog's two fields into a stored total.
+
+    `base_text` is the top row, `add_text` the Add field, `quick` the
+    amount from a +15m/+30m/+1h button (0 for a plain OK). Both fields
+    go through _parse_add_delta, so the dialog has one grammar rather
+    than a lenient total and a strict adjustment — and neither field
+    takes a days unit. Everything lands in minutes, so overflow
+    normalises for free: 50m + 30m is 80 minutes, which _format_hm
+    renders as "01h 20m".
+
+    Clamped at 0: a subtraction bigger than the running total empties
+    the day rather than going negative, and storing 0 drops the row
+    (the no-row-for-empty-day convention). There is no matching clamp
+    at the top — a result over 24 h is refused on accept by the dialog
+    rather than quietly truncated (addendum §13d).
+
+    Raises AddDeltaError if either field is non-empty and unparseable.
+    """
+    base = _parse_add_delta(base_text)
+    return max(0, base + _parse_add_delta(add_text) + quick)
 
 
 def _color_swatch_icon(color: QColor, size: int = 14) -> QIcon:
@@ -400,6 +595,151 @@ class AddRecordDialog(QDialog):
             self._date_edit.date().toString("yyyy-MM-dd"),
             _parse_dhm(self._duration_edit.text()),
         )
+
+
+class RetimeSessionDialog(QDialog):
+    """The active-session Retime dialog (addendum §13d).
+
+    Three parts, top to bottom:
+
+    - **Total** — a free-text `Xh Xm` field, prefilled with today's
+      true total (banked + midnight-split live elapsed). Retyping it
+      alone still works. No days field: this edits one (tag, date)
+      row and a row cannot span days.
+    - **Add** — an optional adjustment, parsed by the same grammar.
+      It does NOT mutate the Total field as you type: nothing is
+      applied until the dialog is accepted, so the top row keeps
+      showing what is currently stored.
+    - **Quick buttons** — +15m / +30m / +1h. One click folds in Total
+      + Add + that amount and closes; they don't stack and they don't
+      write into the Add field.
+
+    On accept the two fields are folded into one minute count
+    (_fold_in_minutes) which the caller writes through the ordinary
+    replace path — the Add row is a different *input* to the existing
+    retime write, not a second write path.
+
+    Two things block an accept, both reported in one inline error
+    label under the Add field, never a modal box:
+
+    - a field that doesn't parse, and
+    - a folded total above MAX_MINUTES (24 h). A day can't hold more,
+      so that's a typo. It is refused, not clamped — unlike the
+      clamp-at-0 on the other end, where 0 is a meaningful total that
+      simply drops the row.
+
+    The ceiling applies on accept only. Rows over 24 h can already
+    exist (the web editor and the Archive can write them), so the
+    dialog opens on one and displays it — refusing to load would make
+    the tool for fixing a bad number the one tool that won't open on
+    it.
+
+    Only the active-session Retime uses this. The Archive row's Retime
+    stays a plain retype-the-value prompt in `Dd Hh Mm` — it is the
+    escape hatch for multi-day corrections (§13a, §13d).
+    """
+
+    QUICK_ADDS = (("+15m", 15), ("+30m", 30), ("+1h", 60))
+    MAX_MINUTES = 24 * 60
+
+    def __init__(self, tag: str, prefill: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Retime session")
+        # None until an accept succeeds — the caller reads this as
+        # "cancelled", so it must exist before anything can be wired.
+        self._result_minutes: Optional[int] = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(f"Total time for today's '{tag}' session:", self),
+        )
+        self.total_edit = QLineEdit(prefill, self)
+        layout.addWidget(self.total_edit)
+
+        layout.addWidget(QLabel("Add (optional):", self))
+        self.add_edit = QLineEdit(self)
+        self.add_edit.setPlaceholderText("e.g. 45m, 1h30, 1:30, 90, -20")
+        # Enter in the Add field does what the default (OK) button does.
+        # Wired explicitly rather than left to Qt's default-button
+        # routing: QLineEdit ignores Return so it bubbles to the dialog,
+        # but only once the dialog is shown and has a focus widget. The
+        # connection makes it unconditional. If both fire, the second
+        # _try_accept re-folds identical fields to the identical total.
+        self.add_edit.returnPressed.connect(self._try_accept)
+        layout.addWidget(self.add_edit)
+
+        self.error_label = QLabel(self)
+        self.error_label.setStyleSheet("color: #C0392B;")
+        self.error_label.setWordWrap(True)
+        self.error_label.setVisible(False)
+        layout.addWidget(self.error_label)
+
+        quick_row = QHBoxLayout()
+        self.quick_buttons: Dict[int, QPushButton] = {}
+        for text, minutes in self.QUICK_ADDS:
+            button = QPushButton(text, self)
+            # Not the default button — Enter must still mean OK.
+            button.setAutoDefault(False)
+            button.clicked.connect(
+                lambda _checked=False, m=minutes: self._try_accept(m),
+            )
+            quick_row.addWidget(button)
+            self.quick_buttons[minutes] = button
+        layout.addLayout(quick_row)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        self.ok_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok,
+        )
+        self.ok_button.setDefault(True)
+        self.buttons.accepted.connect(self._try_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.add_edit.setFocus()
+
+    def _try_accept(self, quick: int = 0) -> None:
+        """Fold the fields together and accept — unless a field is
+        unparseable or the result is over the ceiling, in which case
+        stay open with an inline error."""
+        blank = not self.total_edit.text().strip()
+        if blank and not self.add_edit.text().strip():
+            # Both fields blank is the long-standing "empty input
+            # cancels" behaviour, not a request to zero the day.
+            self.reject()
+            return
+        try:
+            minutes = _fold_in_minutes(
+                self.total_edit.text(), self.add_edit.text(), quick,
+            )
+        except AddDeltaError:
+            self._refuse("Can't read that — try 45m, 1h30, 1:30, 90 or -20.")
+            return
+        if minutes > self.MAX_MINUTES:
+            # Checked on the folded total, not on either field alone:
+            # "+8h" is fine on its own and a mistake on top of 20h.
+            self._refuse("24h limit exceeded")
+            return
+        self.error_label.setVisible(False)
+        self._result_minutes = minutes
+        self.accept()
+
+    def _refuse(self, message: str) -> None:
+        """Block the accept: show `message` inline under the Add field
+        and put the cursor back where the fix is most likely needed."""
+        self.error_label.setText(message)
+        self.error_label.setVisible(True)
+        self.add_edit.setFocus()
+        self.add_edit.selectAll()
+
+    def result_minutes(self) -> Optional[int]:
+        """The folded total in minutes, or None if the dialog was
+        cancelled (including the both-fields-blank case)."""
+        return self._result_minutes
 
 
 # ---- Archive palette (brief addendum) -------------------------------------
@@ -2051,8 +2391,19 @@ class App:
         the rebase; it belongs to an earlier row that Retime did not
         touch.
 
-        Empty input cancels. Setting to zero drops the row (matches
-        the no-row-for-empty-day invariant)."""
+        Since v0.2.4 the dialog is RetimeSessionDialog: an `Xh Xm` top
+        row (no days — a row is one calendar day), an Add row, quick
+        +15m/+30m/+1h buttons, and a 24 h ceiling refused on accept
+        (addendum §13d). All of that only changes what number arrives
+        here: the fold-in and the validation happen inside the dialog
+        and the write below — replace, rebase, clear the snapshot — is
+        the same one it always was. Nothing about §13b may be skipped
+        on the add path — skipping the snapshot clear there is exactly
+        how the 187 → 374 doubling would come back.
+
+        Empty input cancels. Setting to zero — including by subtracting
+        past it — drops the row (matches the no-row-for-empty-day
+        invariant)."""
         if self.tracker.tag is None:
             QMessageBox.information(
                 self.widget, "Retime session",
@@ -2068,14 +2419,11 @@ class App:
         banked = storage.today_minutes_for_tag(self.tracker.tag, today_str)
         live_today = self.tracker.get_daily_seconds(now=now).get(today, 0.0)
         current_mins = banked + _seconds_to_minutes(live_today)
-        new_text, ok = QInputDialog.getText(
-            self.widget, "Retime session",
-            f"Total time for today's '{self.tracker.tag}' session:",
-            text=_format_dhm(current_mins),
+        new_mins = self._prompt_retime_total(
+            self.tracker.tag, _format_hm(current_mins),
         )
-        if not ok or not new_text.strip():
+        if new_mins is None:
             return
-        new_mins = _parse_dhm(new_text)
         storage.set_minutes_for_tag_date(
             self.tracker.tag, today_str, new_mins,
             session_name=self._pending_session_name,
@@ -2088,6 +2436,20 @@ class App:
         # row. Mirrors on_save_session's clear for the same reason.
         storage.clear_active_snapshot()
         self._refresh_carry_from_storage()
+
+    def _prompt_retime_total(
+        self, tag: str, prefill: str,
+    ) -> Optional[int]:
+        """Run the Retime dialog; return the folded total in minutes,
+        or None if the user cancelled.
+
+        A thin seam so on_retime_session stays about the write and the
+        dialog stays about input — and so tests can drive one without
+        the other."""
+        dialog = RetimeSessionDialog(tag, prefill, parent=self.widget)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.result_minutes()
 
     def on_delete_session(self) -> None:
         sessions = storage.load_sessions()
